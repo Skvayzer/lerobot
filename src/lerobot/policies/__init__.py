@@ -18,3 +18,6 @@ from .pi0.configuration_pi0 import PI0Config as PI0Config
 from .smolvla.configuration_smolvla import SmolVLAConfig as SmolVLAConfig
 from .tdmpc.configuration_tdmpc import TDMPCConfig as TDMPCConfig
 from .vqbet.configuration_vqbet import VQBeTConfig as VQBeTConfig
+# === IsaacGr00t START ===
+from .gr00t.configuration_gr00t import IsaacGr00tConfig as IsaacGr00tConfig
+# === IsaacGr00t END ===
