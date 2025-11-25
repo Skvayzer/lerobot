@@ -45,6 +45,11 @@ class SmolVLAConfig(PreTrainedConfig):
 
     # Image preprocessing
     resize_imgs_with_padding: tuple[int, int] = (512, 512)
+    # Let users request more canonical camera keys (camera1..cameraN) than the
+    # base checkpoint ships with. Defaults to 3 to match the pretrained config
+    # but can be bumped (e.g. --policy.max_camera_views=4) when a dataset
+    # provides extra streams like cam_right_wrist.
+    max_camera_views: int = 3
 
     # Add empty images. Used by smolvla_aloha_sim which adds the empty
     # left and right wrist cameras in addition to the top camera.
@@ -117,6 +122,25 @@ class SmolVLAConfig(PreTrainedConfig):
             )
 
     def validate_features(self) -> None:
+        image_feature_shape = next(
+            (
+                tuple(ft.shape)
+                for key, ft in self.input_features.items()
+                if key.startswith(OBS_IMAGES)
+                and ft.type is FeatureType.VISUAL
+                and ft.shape is not None
+            ),
+            (3, 256, 256),
+        )
+
+        for cam_idx in range(1, self.max_camera_views + 1):
+            key = f"{OBS_IMAGES}.camera{cam_idx}"
+            if key not in self.input_features:
+                self.input_features[key] = PolicyFeature(
+                    type=FeatureType.VISUAL,
+                    shape=image_feature_shape,
+                )
+
         for i in range(self.empty_cameras):
             key = f"{OBS_IMAGES}.empty_camera_{i}"
             empty_camera = PolicyFeature(
@@ -153,3 +177,6 @@ class SmolVLAConfig(PreTrainedConfig):
     @property
     def reward_delta_indices(self) -> None:
         return None
+
+
+# python src/lerobot/scripts/lerobot_train.py   --dataset.repo_id=unitreerobotics/G1_Dex3_BlockStacking_Dataset   --batch_size=64   --policy.push_to_hub=false   --wandb.enable=true   --wandb.project=G1_block_stacking   --wandb.entity=skvayzer   --wandb.notes="unitree G1 object placement smolvla" --policy.path=lerobot/smolvla_base --rename_map='{"observation.images.cam_left_high":  "observation.images.camera1", "observation.images.cam_right_high": "observation.images.camera2", "observation.images.cam_left_wrist": "observation.images.camera3",  "observation.images.cam_right_wrist":"observation.images.camera4"}' --dataset.tolerance_s=5e-4 

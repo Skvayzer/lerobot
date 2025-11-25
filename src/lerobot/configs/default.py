@@ -35,6 +35,9 @@ class DatasetConfig:
     use_imagenet_stats: bool = True
     video_backend: str = field(default_factory=get_safe_default_codec)
     streaming: bool = False
+    # Allow overriding the tolerance used when aligning timestamps to frame
+    # indices. Defaults to the canonical 1e-4 seconds.
+    tolerance_s: float = 1e-4
 
 
 @dataclass

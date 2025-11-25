@@ -98,6 +98,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
                 image_transforms=image_transforms,
                 revision=cfg.dataset.revision,
                 video_backend=cfg.dataset.video_backend,
+                tolerance_s=cfg.dataset.tolerance_s,
             )
         else:
             dataset = StreamingLeRobotDataset(
@@ -108,6 +109,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
                 image_transforms=image_transforms,
                 revision=cfg.dataset.revision,
                 max_num_shards=cfg.num_workers,
+                tolerance_s=cfg.dataset.tolerance_s,
             )
     else:
         raise NotImplementedError("The MultiLeRobotDataset isn't supported for now.")
@@ -117,6 +119,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             # delta_timestamps=delta_timestamps,
             image_transforms=image_transforms,
             video_backend=cfg.dataset.video_backend,
+            tolerance_s=cfg.dataset.tolerance_s,
         )
         logging.info(
             "Multiple datasets were provided. Applied the following index mapping to the provided datasets: "
