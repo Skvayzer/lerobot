@@ -36,7 +36,7 @@ from lerobot.configs.types import (
     NormalizationMode,
     PolicyFeature,
 )
-from lerobot.policies.groot.configuration_groot import GrootConfig
+from lerobot.policies.grootCoT.configuration_groot import GrootCoTConfig
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
     DeviceProcessorStep,
@@ -52,17 +52,34 @@ from lerobot.processor.converters import (
 )
 from lerobot.processor.core import EnvTransition, TransitionKey
 from lerobot.utils.constants import (
-    HF_LEROBOT_HOME,
     POLICY_POSTPROCESSOR_DEFAULT_NAME,
     POLICY_PREPROCESSOR_DEFAULT_NAME,
 )
 
-# Defaults for Eagle processor locations
-DEFAULT_TOKENIZER_ASSETS_REPO = "lerobot/eagle2hg-processor-groot-n1p5"
+# Defaults for VLM processor locations
+DEFAULT_QWEN_PROCESSOR_MODEL_ID = "Qwen/Qwen3-VL-8B-Thinking"
+SUMMARY_TOKEN = "<SUMMARY>"
+SUMMARY_PROMPT = "Think briefly (<=20 tokens), then summarize. " + SUMMARY_TOKEN
+QWEN_CONTENT_KEY = "qwen_content"
+LEGACY_EAGLE_CONTENT_KEY = "eagle_content"
+QWEN_INPUT_PREFIX = "qwen_"
+LEGACY_EAGLE_INPUT_PREFIX = "eagle_"
+DEFAULT_DEX3_CANONICAL_CAMERA_ORDER = [
+    "observation.images.cam_left_high",
+    "observation.images.cam_right_high",
+    "observation.images.cam_left_wrist",
+    "observation.images.cam_right_wrist",
+]
+DEFAULT_DEX3_CAMERA_ALIASES = {
+    "observation.images.cam_left_high": ["observation.images.left_high", "observation.images.left_high_rgb"],
+    "observation.images.cam_right_high": ["observation.images.right_high", "observation.images.right_high_rgb"],
+    "observation.images.cam_left_wrist": ["observation.images.left_wrist", "observation.images.left_wrist_rgb"],
+    "observation.images.cam_right_wrist": ["observation.images.right_wrist", "observation.images.right_wrist_rgb"],
+}
 
 
 def make_groot_pre_post_processors(
-    config: GrootConfig, dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None
+    config: GrootCoTConfig, dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None
 ) -> tuple[
     PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     PolicyProcessorPipeline[PolicyAction, PolicyAction],
@@ -76,8 +93,8 @@ def make_groot_pre_post_processors(
     1. Optional key renaming (dataset-specific key mapping)
     2. Add batch dimension to unbatched data
     3. Pack video/state/action/language/embodiment and apply optional min-max normalization before padding
-    4. Encode video+language with Eagle VLM into intermediate eagle_content
-    5. Collate eagle_content into batched eagle_* tensors
+    4. Encode video+language with Qwen VLM into intermediate qwen_content
+    5. Collate qwen_content into batched qwen_* tensors
     6. Move tensors to device (GPU)
 
     NOTE: We optionally apply min-max normalization to STATE and ACTION using
@@ -150,14 +167,21 @@ def make_groot_pre_post_processors(
             embodiment_tag=config.embodiment_tag,
             normalize_min_max=True,
             stats=padded_stats,
+            enforce_dex3_canonical_camera_order=getattr(
+                config, "enforce_dex3_canonical_camera_order", True
+            ),
+            dex3_canonical_camera_order=list(
+                getattr(config, "dex3_canonical_camera_order", DEFAULT_DEX3_CANONICAL_CAMERA_ORDER)
+            ),
+            dex3_missing_camera_policy=getattr(config, "dex3_missing_camera_policy", "zero_fill"),
         ),
-        # 4. Eagle encode (creates eagle_content)
-        GrootEagleEncodeStep(
-            tokenizer_assets_repo=config.tokenizer_assets_repo,
+        # 4. Qwen encode (creates qwen_content)
+        GrootQwenEncodeStep(
+            processor_model_id=config.vlm_processor_model_id,
         ),
-        # 5. Collate eagle_content -> eagle_* tensors
-        GrootEagleCollateStep(
-            tokenizer_assets_repo=config.tokenizer_assets_repo,
+        # 5. Collate qwen_content -> qwen_* tensors
+        GrootQwenCollateStep(
+            processor_model_id=config.vlm_processor_model_id,
         ),
         # 6. Move to device
         DeviceProcessorStep(device=config.device),
@@ -198,27 +222,16 @@ def _to_uint8_np_bhwc(img_t: torch.Tensor) -> np.ndarray:
     return rearrange(img_t.cpu().numpy(), "b c h w -> b h w c")
 
 
-def _build_eagle_processor(tokenizer_assets_repo: str = DEFAULT_TOKENIZER_ASSETS_REPO) -> ProcessorMixin:
-    # Validate that the cache directory is ready. If not, instruct the user.
-    cache_dir = HF_LEROBOT_HOME / tokenizer_assets_repo
-    required = [
-        cache_dir / "processor_config.json",
-        cache_dir / "preprocessor_config.json",
-        cache_dir / "image_processing_eagle2_5_vl_fast.py",
-    ]
-    if not all(p.exists() for p in required):
-        raise FileNotFoundError(
-            f"[GROOT] Eagle processor cache at '{cache_dir}' is not populated. "
-            "Vendor files are copied during model creation. Create the policy/model first, "
-            "or call ensure_eagle_cache_ready() before building processors."
-        )
-    proc = AutoProcessor.from_pretrained(str(cache_dir), trust_remote_code=True, use_fast=True)
-    proc.tokenizer.padding_side = "left"
+def _build_qwen_processor(processor_model_id: str = DEFAULT_QWEN_PROCESSOR_MODEL_ID) -> ProcessorMixin:
+    proc = AutoProcessor.from_pretrained(processor_model_id, trust_remote_code=True)
+    # Align padding with autoregressive usage
+    if hasattr(proc, "tokenizer") and proc.tokenizer:
+        proc.tokenizer.padding_side = "left"
     return proc
 
 
 @dataclass
-@ProcessorStepRegistry.register(name="groot_infer_state_v1")
+@ProcessorStepRegistry.register(name="groot_cot_infer_state_v1")
 class GrootInferStateFromObsStep(ProcessorStep):
     """Create observation.state from other observation keys when missing.
 
@@ -237,7 +250,7 @@ class GrootInferStateFromObsStep(ProcessorStep):
             return transition
 
         obs = transition.get(TransitionKey.OBSERVATION, {}) or {}
-        if OBS_STATE in obs:
+        if "observation.state" in obs:
             return transition
 
         # Build candidate key list
@@ -253,7 +266,7 @@ class GrootInferStateFromObsStep(ProcessorStep):
                 keys = [k for k in keys if not exclude.search(k)]
 
         # Default heuristic: exclude image-like keys
-        keys = [k for k in keys if not k.startswith(OBS_IMAGES) and k != OBS_IMAGE]
+        keys = [k for k in keys if not k.startswith("observation.images.") and k != "observation.image"]
 
         # Deterministic ordering
         keys = sorted(keys)
@@ -283,12 +296,17 @@ class GrootInferStateFromObsStep(ProcessorStep):
         if state.shape[1] > self.max_state_dim:
             state = state[:, : self.max_state_dim]
 
-        obs[OBS_STATE] = state
+        obs["observation.state"] = state
         return transition
+
+    # Pipeline API requirement: declare how features change.
+    # This step infers runtime values only; it does not change static feature specs.
+    def transform_features(self, features):
+        return features
 
 
 @dataclass
-@ProcessorStepRegistry.register(name="groot_pack_inputs_v3")
+@ProcessorStepRegistry.register(name="groot_cot_pack_inputs_v3")
 class GrootPackInputsStep(ProcessorStep):
     state_horizon: int = 1
     action_horizon: int = 16
@@ -310,8 +328,37 @@ class GrootPackInputsStep(ProcessorStep):
     # Min-max normalization (SO100-like) applied BEFORE padding
     normalize_min_max: bool = True
     stats: dict[str, dict[str, Any]] | None = None
+    # Dex3 canonical multi-view packing support.
+    enforce_dex3_canonical_camera_order: bool = True
+    dex3_canonical_camera_order: list[str] = field(
+        default_factory=lambda: list(DEFAULT_DEX3_CANONICAL_CAMERA_ORDER)
+    )
+    dex3_camera_aliases: dict[str, list[str]] = field(
+        default_factory=lambda: {k: list(v) for k, v in DEFAULT_DEX3_CAMERA_ALIASES.items()}
+    )
+    dex3_missing_camera_policy: str = "zero_fill"
+
+    def _resolve_dex3_camera_key(self, obs: dict[str, Any], canonical_key: str) -> str | None:
+        candidates = [canonical_key, *(self.dex3_camera_aliases.get(canonical_key, []))]
+        for key in candidates:
+            if key in obs:
+                return key
+        return None
+
+    def _use_dex3_canonical_order(self, obs: dict[str, Any]) -> bool:
+        if not self.enforce_dex3_canonical_camera_order:
+            return False
+        return any(
+            self._resolve_dex3_camera_key(obs, canonical_key) is not None
+            for canonical_key in self.dex3_canonical_camera_order
+        )
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
+        if self.dex3_missing_camera_policy not in {"zero_fill", "error"}:
+            raise ValueError(
+                "dex3_missing_camera_policy must be one of {'zero_fill', 'error'}."
+            )
+
         obs = transition.get(TransitionKey.OBSERVATION, {}) or {}
         comp = transition.get(TransitionKey.COMPLEMENTARY_DATA, {}) or {}
 
@@ -347,19 +394,46 @@ class GrootPackInputsStep(ProcessorStep):
             return torch.where(mask, mapped, torch.zeros_like(mapped))
 
         # 1) Video (B, T=1, V, H, W, C) uint8
-        img_keys = sorted([k for k in obs if k.startswith("observation.images.")])
-        if not img_keys and "observation.image" in obs:
-            img_keys = ["observation.image"]
-        if img_keys:
-            cams = [_to_uint8_np_bhwc(obs[k]) for k in img_keys]
+        available_img_keys = sorted([k for k in obs if k.startswith("observation.images.")])
+        img_tensors: list[torch.Tensor] = []
+        if self._use_dex3_canonical_order(obs):
+            ref_img = next(
+                (obs[k] for k in available_img_keys if isinstance(obs.get(k), torch.Tensor)),
+                None,
+            )
+            for canonical_key in self.dex3_canonical_camera_order:
+                resolved_key = self._resolve_dex3_camera_key(obs, canonical_key)
+                if resolved_key is None:
+                    if self.dex3_missing_camera_policy == "error":
+                        raise ValueError(
+                            "Missing canonical Dex3 camera input while strict policy is enabled: "
+                            f"{canonical_key}. Available={available_img_keys}"
+                        )
+                    if ref_img is None:
+                        raise ValueError(
+                            "Cannot zero-fill missing canonical Dex3 camera because no reference "
+                            f"image tensor is available. Missing={canonical_key}"
+                        )
+                    img_tensors.append(torch.zeros_like(ref_img))
+                else:
+                    img_tensors.append(obs[resolved_key])
+        else:
+            fallback_keys = available_img_keys
+            if not fallback_keys and "observation.image" in obs:
+                fallback_keys = ["observation.image"]
+            img_tensors = [obs[k] for k in fallback_keys]
+
+        if img_tensors:
+            cams = [_to_uint8_np_bhwc(img) for img in img_tensors]
             video = np.stack(cams, axis=1)  # (B, V, H, W, C)
             video = np.expand_dims(video, axis=1)  # (B, 1, V, H, W, C)
             # GR00T validates that video.shape[3] == 3 (channels), so reorder to (B, T, V, C, H, W)
             video = np.transpose(video, (0, 1, 2, 5, 3, 4))  # (B, 1, V, C, H, W)
             obs["video"] = video
             # Drop raw images to avoid confusion downstream
-            for k in img_keys:
+            for k in available_img_keys:
                 obs.pop(k, None)
+            obs.pop("observation.image", None)
 
         # 2) Language (string)
         lang = comp.get(self.language_key)
@@ -367,6 +441,8 @@ class GrootPackInputsStep(ProcessorStep):
             lang = lang[0] if len(lang) > 0 else None
         if not lang:
             lang = "Perform the task."
+        # Append summary prompt/sentinel for downstream summary-state pooling
+        lang = f"{lang}\n{SUMMARY_PROMPT}"
         if self.formalize_language:
             lang = (lang or "").lower()
             lang = "".join(ch for ch in lang if ch.isalnum() or ch.isspace())
@@ -470,6 +546,10 @@ class GrootPackInputsStep(ProcessorStep):
             "embodiment_tag": self.embodiment_tag,
             "embodiment_mapping": self.embodiment_mapping,
             "normalize_min_max": self.normalize_min_max,
+            "enforce_dex3_canonical_camera_order": self.enforce_dex3_canonical_camera_order,
+            "dex3_canonical_camera_order": self.dex3_canonical_camera_order,
+            "dex3_camera_aliases": self.dex3_camera_aliases,
+            "dex3_missing_camera_policy": self.dex3_missing_camera_policy,
         }
 
     def state_dict(self) -> dict[str, torch.Tensor]:
@@ -510,15 +590,16 @@ class GrootPackInputsStep(ProcessorStep):
 
 
 @dataclass
-@ProcessorStepRegistry.register(name="groot_eagle_encode_v3")
-class GrootEagleEncodeStep(ProcessorStep):
-    tokenizer_assets_repo: str = DEFAULT_TOKENIZER_ASSETS_REPO
+@ProcessorStepRegistry.register(name="groot_cot_qwen_encode_v1")
+@ProcessorStepRegistry.register(name="groot_cot_eagle_encode_v3")
+class GrootQwenEncodeStep(ProcessorStep):
+    processor_model_id: str = DEFAULT_QWEN_PROCESSOR_MODEL_ID
     _proc: ProcessorMixin | None = field(default=None, init=False, repr=False)
 
     @property
     def proc(self) -> ProcessorMixin:
         if self._proc is None:
-            self._proc = _build_eagle_processor(self.tokenizer_assets_repo)
+            self._proc = _build_qwen_processor(self.processor_model_id)
         return self._proc
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
@@ -534,7 +615,7 @@ class GrootEagleEncodeStep(ProcessorStep):
             lang = lang[0] if len(lang) > 0 else "Perform the task."
 
         bsz = video.shape[0]
-        eagle_contents: list[dict[str, Any]] = []
+        qwen_contents: list[dict[str, Any]] = []
         for b in range(bsz):
             vt = video[b]  # (T, V, C, H, W) after reorder
             if vt.ndim != 5:
@@ -550,17 +631,16 @@ class GrootEagleEncodeStep(ProcessorStep):
             text_content = [{"type": "text", "text": lang_formatted}]
             image_content = [{"type": "image", "image": img} for img in images]
             conv = [{"role": "user", "content": image_content + text_content}]
-            text_list = [self.proc.apply_chat_template(conv, tokenize=False, add_generation_prompt=True)]
-            img_inputs, vid_inputs = self.proc.process_vision_info(conv)
-            eagle_contents.append(
+            prompt = self.proc.apply_chat_template(conv, tokenize=False, add_generation_prompt=True)
+            qwen_contents.append(
                 {
-                    "text_list": text_list,
-                    "image_inputs": img_inputs,
-                    "video_inputs": vid_inputs,
+                    "text": prompt,
+                    "images": images,
                 }
             )
 
-        comp["eagle_content"] = eagle_contents
+        comp[QWEN_CONTENT_KEY] = qwen_contents
+        comp.pop(LEGACY_EAGLE_CONTENT_KEY, None)
         transition[TransitionKey.OBSERVATION] = obs
         transition[TransitionKey.COMPLEMENTARY_DATA] = comp
         return transition
@@ -570,31 +650,62 @@ class GrootEagleEncodeStep(ProcessorStep):
         return features
 
 
-# Original GR00T-style collate: converts eagle_content -> eagle_* tensors
-def collate(features: list[dict[str, Any]], eagle_processor: ProcessorMixin) -> dict[str, Any]:
+def collate_multimodal(
+    features: list[dict[str, Any]],
+    processor: ProcessorMixin,
+    *,
+    content_key: str,
+    output_prefix: str,
+) -> dict[str, Any]:
+    """Collate multimodal chat content into prefixed tensor keys.
+
+    This is used by Qwen-backed pipelines (qwen_*) and kept flexible so legacy
+    Eagle-prefixed checkpoints can still be loaded.
+    """
     batch: dict[str, Any] = {}
     keys = features[0].keys()
 
     for key in keys:
         values = [elem[key] for elem in features]
 
-        if key == "eagle_content":
+        if key == content_key:
             text_list: list[str] = []
             image_inputs: list[Any] = []
+            num_images_per_sample: list[int] = []
             for v in values:
-                curr_text_list = v["text_list"]
-                curr_image_inputs = v["image_inputs"]
-                text_list += curr_text_list
-                image_inputs += curr_image_inputs
-            eagle_inputs = eagle_processor(
-                text=text_list,
-                images=image_inputs,
-                images_kwargs={"min_dynamic_tiles": 1, "max_dynamic_tiles": 1, "use_thumbnail": False},
-                return_tensors="pt",
-                padding=True,
-            )
-            for k, v in eagle_inputs.items():
-                k = "eagle_" + k
+                text_list.append(v["text"])
+                image_inputs.append(v["images"])
+                num_images_per_sample.append(len(v["images"]))
+            model_inputs = processor(text=text_list, images=image_inputs, return_tensors="pt", padding=True)
+            total_imgs = sum(num_images_per_sample)
+            # Reshape flattened vision outputs when processor returns (sum_imgs*tokens, dim) and grid (B, num_imgs, 3)
+            if "pixel_values" in model_inputs and "image_grid_thw" in model_inputs:
+                pv = model_inputs["pixel_values"]
+                grid = model_inputs["image_grid_thw"]
+                # If pixel_values is 2D (flattened tokens), try to reconstruct (B, num_imgs, tokens, dim)
+                if pv.dim() == 2 and grid.dim() == 3:
+                    tokens_per_img = (grid[..., 1] * grid[..., 2]).view(-1).tolist()
+                    if sum(tokens_per_img) == pv.shape[0]:
+                        splits = torch.split(pv, tokens_per_img, dim=0)
+                        regrouped = []
+                        idx = 0
+                        for n_img in num_images_per_sample:
+                            regrouped.append(torch.stack(splits[idx : idx + n_img], dim=0))
+                            idx += n_img
+                        model_inputs["pixel_values"] = torch.stack(regrouped, dim=0)  # (B, num_imgs, tokens, dim)
+                    else:
+                        print(
+                            f"[GROOT][WARN] Unexpected pixel_values shape {tuple(pv.shape)} for grids {tuple(grid.shape)}; leaving as-is."
+                        )
+                # Ensure grid is shaped (B, num_imgs, 3)
+                if grid.shape[0] != len(num_images_per_sample) or grid.dim() != 3:
+                    if grid.shape[0] == total_imgs:
+                        splits = torch.split(grid, num_images_per_sample, dim=0)
+                        model_inputs["image_grid_thw"] = torch.stack(splits, dim=0)
+                    else:
+                        print(f"[GROOT][WARN] Unexpected image_grid_thw shape {tuple(grid.shape)}; leaving as-is.")
+            for k, v in model_inputs.items():
+                k = output_prefix + k
                 batch[k] = v
         elif key in ("pixel_values", "image_grid_thw", "attention_mask", "input_ids"):
             # Concat in existing batch dimension.
@@ -606,36 +717,66 @@ def collate(features: list[dict[str, Any]], eagle_processor: ProcessorMixin) -> 
     return batch
 
 
+# Backward-compatible helper kept for external imports/tests.
+def collate(features: list[dict[str, Any]], eagle_processor: ProcessorMixin) -> dict[str, Any]:
+    return collate_multimodal(
+        features,
+        eagle_processor,
+        content_key=LEGACY_EAGLE_CONTENT_KEY,
+        output_prefix=LEGACY_EAGLE_INPUT_PREFIX,
+    )
+
+
 @dataclass
-@ProcessorStepRegistry.register(name="groot_eagle_collate_v3")
-class GrootEagleCollateStep(ProcessorStep):
-    tokenizer_assets_repo: str = DEFAULT_TOKENIZER_ASSETS_REPO
+@ProcessorStepRegistry.register(name="groot_cot_qwen_collate_v1")
+@ProcessorStepRegistry.register(name="groot_cot_eagle_collate_v3")
+class GrootQwenCollateStep(ProcessorStep):
+    processor_model_id: str = DEFAULT_QWEN_PROCESSOR_MODEL_ID
     _proc: ProcessorMixin | None = field(default=None, init=False, repr=False)
 
     @property
     def proc(self) -> ProcessorMixin:
         if self._proc is None:
-            self._proc = _build_eagle_processor(self.tokenizer_assets_repo)
+            self._proc = _build_qwen_processor(self.processor_model_id)
         return self._proc
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         obs = transition.get(TransitionKey.OBSERVATION, {}) or {}
         comp = transition.get(TransitionKey.COMPLEMENTARY_DATA, {}) or {}
-        contents = comp.get("eagle_content")
+        content_key = QWEN_CONTENT_KEY
+        contents = comp.get(content_key)
+        if not contents:
+            # Backward compatibility for older checkpoints
+            content_key = LEGACY_EAGLE_CONTENT_KEY
+            contents = comp.get(content_key)
         if not contents:
             return transition
 
         # Build features list as original API expects: one dict per batch item
-        features = [{"eagle_content": content} for content in contents]
-        batched = collate(features, self.proc)
+        features = [{content_key: content} for content in contents]
+        batched = collate_multimodal(
+            features,
+            self.proc,
+            content_key=content_key,
+            output_prefix=QWEN_INPUT_PREFIX,
+        )
 
-        # Inject eagle_* tensors and remove the temporary content and raw video to free memory
+        # Compute summary position (last non-pad token) for each sample
+        qwen_ids_key = QWEN_INPUT_PREFIX + "input_ids"
+        qwen_attn_key = QWEN_INPUT_PREFIX + "attention_mask"
+        if qwen_ids_key in batched and qwen_attn_key in batched:
+            attn = batched[qwen_attn_key]
+            summary_pos = attn.sum(dim=1) - 1  # last non-pad token index
+            batched[QWEN_INPUT_PREFIX + "summary_pos"] = summary_pos.to(torch.long)
+
+        # Inject qwen_* tensors and remove temporary content/raw video to free memory
         for k, v in batched.items():
             comp[k] = v
-        comp.pop("eagle_content", None)
+        comp.pop(QWEN_CONTENT_KEY, None)
+        comp.pop(LEGACY_EAGLE_CONTENT_KEY, None)
         obs.pop(
             "video", None
-        )  # The video has been fully encoded into eagle_* tensors, so we don't need the raw video anymore
+        )  # Raw video is encoded into qwen_* tensors; no need to keep it.
         transition[TransitionKey.OBSERVATION] = obs
         transition[TransitionKey.COMPLEMENTARY_DATA] = comp
         return transition
@@ -645,7 +786,7 @@ class GrootEagleCollateStep(ProcessorStep):
 
 
 @dataclass
-@ProcessorStepRegistry.register(name="groot_action_unpack_unnormalize_v1")
+@ProcessorStepRegistry.register(name="groot_cot_action_unpack_unnormalize_v1")
 class GrootActionUnpackUnnormalizeStep(ProcessorStep):
     env_action_dim: int = 0
     # Apply inverse of min-max normalization if it was used in preprocessor
@@ -741,3 +882,11 @@ class GrootActionUnpackUnnormalizeStep(ProcessorStep):
 
         if reconstructed:
             self.stats = reconstructed
+
+
+# Alias for factory.py dynamic loading
+make_groot_cot_pre_post_processors = make_groot_pre_post_processors
+
+# Backward-compatible class aliases for older imports/checkpoint codepaths.
+GrootEagleEncodeStep = GrootQwenEncodeStep
+GrootEagleCollateStep = GrootQwenCollateStep

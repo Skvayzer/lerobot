@@ -17,6 +17,7 @@ import contextlib
 import importlib.resources
 import json
 import logging
+import re
 from collections import deque
 from collections.abc import Iterable, Iterator
 from pathlib import Path
@@ -28,6 +29,7 @@ import numpy as np
 import packaging.version
 import pandas
 import pandas as pd
+import pyarrow.dataset as pa_ds
 import pyarrow.parquet as pq
 import torch
 from datasets import Dataset
@@ -48,7 +50,7 @@ from lerobot.utils.utils import SuppressProgressBars, is_valid_numpy_dtype_strin
 
 DEFAULT_CHUNK_SIZE = 1000  # Max number of files per chunk
 DEFAULT_DATA_FILE_SIZE_IN_MB = 100  # Max size per file
-DEFAULT_VIDEO_FILE_SIZE_IN_MB = 500  # Max size per file
+DEFAULT_VIDEO_FILE_SIZE_IN_MB = 200  # Max size per file
 
 INFO_PATH = "meta/info.json"
 STATS_PATH = "meta/stats.json"
@@ -59,6 +61,7 @@ VIDEO_DIR = "videos"
 
 CHUNK_FILE_PATTERN = "chunk-{chunk_index:03d}/file-{file_index:03d}"
 DEFAULT_TASKS_PATH = "meta/tasks.parquet"
+DEFAULT_SUBTASKS_PATH = "meta/subtasks.parquet"
 DEFAULT_EPISODES_PATH = EPISODES_DIR + "/" + CHUNK_FILE_PATTERN + ".parquet"
 DEFAULT_DATA_PATH = DATA_DIR + "/" + CHUNK_FILE_PATTERN + ".parquet"
 DEFAULT_VIDEO_PATH = VIDEO_DIR + "/{video_key}/" + CHUNK_FILE_PATTERN + ".mp4"
@@ -103,7 +106,9 @@ def update_chunk_file_indices(chunk_idx: int, file_idx: int, chunks_size: int) -
     return chunk_idx, file_idx
 
 
-def load_nested_dataset(pq_dir: Path, features: datasets.Features | None = None) -> Dataset:
+def load_nested_dataset(
+    pq_dir: Path, features: datasets.Features | None = None, episodes: list[int] | None = None
+) -> Dataset:
     """Find parquet files in provided directory {pq_dir}/chunk-xxx/file-xxx.parquet
     Convert parquet files to pyarrow memory mapped in a cache folder for efficient RAM usage
     Concatenate all pyarrow references to return HF Dataset format
@@ -111,15 +116,74 @@ def load_nested_dataset(pq_dir: Path, features: datasets.Features | None = None)
     Args:
         pq_dir: Directory containing parquet files
         features: Optional features schema to ensure consistent loading of complex types like images
+        episodes: Optional list of episode indices to filter. Uses PyArrow predicate pushdown for efficiency.
     """
     paths = sorted(pq_dir.glob("*/*.parquet"))
     if len(paths) == 0:
         raise FileNotFoundError(f"Provided directory does not contain any parquet file: {pq_dir}")
 
-    # TODO(rcadene): set num_proc to accelerate conversion to pyarrow
     with SuppressProgressBars():
-        datasets = Dataset.from_parquet([str(path) for path in paths], features=features)
-    return datasets
+        # When no filtering needed, Dataset uses memory-mapped loading for efficiency
+        # PyArrow loads the entire dataset into memory
+        if episodes is None:
+            return Dataset.from_parquet([str(path) for path in paths], features=features)
+
+        # Fast path for datasets that store one parquet per episode, e.g.
+        # `.../chunk-xxx/episode_000123.parquet`.
+        # This avoids materializing a huge filtered Arrow table in memory.
+        episode_set = {int(ep) for ep in episodes}
+        episode_name_re = re.compile(r"episode_(\d+)\.parquet$")
+        selected_paths: list[Path] = []
+        found_episode_indices: set[int] = set()
+        parseable_episode_paths = True
+        for path in paths:
+            match = episode_name_re.search(path.name)
+            if match is None:
+                parseable_episode_paths = False
+                break
+            ep_idx = int(match.group(1))
+            if ep_idx in episode_set:
+                selected_paths.append(path)
+                found_episode_indices.add(ep_idx)
+
+        if parseable_episode_paths:
+            if len(selected_paths) == 0:
+                raise FileNotFoundError(
+                    f"No local parquet files found for requested episodes in {pq_dir}"
+                )
+            logging.info(
+                "Loading episode-indexed parquet subset from disk: requested=%d, local_found=%d, paths=%d",
+                len(episode_set),
+                len(found_episode_indices),
+                len(selected_paths),
+            )
+            return Dataset.from_parquet([str(path) for path in selected_paths], features=features)
+
+        arrow_dataset = pa_ds.dataset(paths, format="parquet")
+        filter_expr = pa_ds.field("episode_index").isin(episodes)
+        table = arrow_dataset.to_table(filter=filter_expr)
+
+        if features is not None:
+            expected_names = list(features.arrow_schema.names)
+            actual_names = list(table.schema.names)
+            if actual_names != expected_names:
+                missing = [name for name in expected_names if name not in actual_names]
+                extra = [name for name in actual_names if name not in expected_names]
+                if missing or extra:
+                    raise ValueError(
+                        "Filtered parquet table columns do not match target schema names. "
+                        f"missing={missing}, extra={extra}"
+                    )
+                # Legacy v2 datasets can store equivalent schemas with different field order.
+                # Align by column name so Arrow cast succeeds.
+                logging.warning(
+                    "Reordering filtered parquet columns to match target schema for %s",
+                    pq_dir,
+                )
+                table = table.select(expected_names)
+            table = table.cast(features.arrow_schema)
+
+        return Dataset(table)
 
 
 def get_parquet_num_frames(parquet_path: str | Path) -> int:
@@ -335,8 +399,44 @@ def write_tasks(tasks: pandas.DataFrame, local_dir: Path) -> None:
 
 
 def load_tasks(local_dir: Path) -> pandas.DataFrame:
-    tasks = pd.read_parquet(local_dir / DEFAULT_TASKS_PATH)
-    return tasks
+    default_path = local_dir / DEFAULT_TASKS_PATH
+    if default_path.exists():
+        return pd.read_parquet(default_path)
+
+    # Backward compatibility: legacy datasets may store tasks in JSONL.
+    legacy_candidates = [
+        local_dir / LEGACY_TASKS_PATH,
+        local_dir / "tasks.jsonl",
+        local_dir / "meta" / "tasks.jsonl",
+    ]
+    for legacy_path in legacy_candidates:
+        if not legacy_path.exists():
+            continue
+        records: list[dict[str, Any]] = []
+        with open(legacy_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                records.append(json.loads(line))
+        if not records:
+            continue
+        records = sorted(records, key=lambda x: int(x.get("task_index", 0)))
+        task_strings = [str(item.get("task", "")) for item in records]
+        task_indices = [int(item.get("task_index", i)) for i, item in enumerate(records)]
+        return pd.DataFrame({"task_index": task_indices}, index=task_strings)
+
+    raise FileNotFoundError(
+        f"Could not find tasks metadata at '{default_path}' or legacy JSONL paths."
+    )
+
+
+def load_subtasks(local_dir: Path) -> pandas.DataFrame | None:
+    """Load subtasks from subtasks.parquet if it exists."""
+    subtasks_path = local_dir / DEFAULT_SUBTASKS_PATH
+    if subtasks_path.exists():
+        return pd.read_parquet(subtasks_path)
+    return None
 
 
 def write_episodes(episodes: Dataset, local_dir: Path) -> None:
@@ -362,12 +462,67 @@ def write_episodes(episodes: Dataset, local_dir: Path) -> None:
 
 
 def load_episodes(local_dir: Path) -> datasets.Dataset:
-    episodes = load_nested_dataset(local_dir / EPISODES_DIR)
-    # Select episode features/columns containing references to episode data and videos
-    # (e.g. tasks, dataset_from_index, dataset_to_index, data/chunk_index, data/file_index, etc.)
-    # This is to speedup access to these data, instead of having to load episode stats.
-    episodes = episodes.select_columns([key for key in episodes.features if not key.startswith("stats/")])
-    return episodes
+    try:
+        episodes = load_nested_dataset(local_dir / EPISODES_DIR)
+        # Select episode features/columns containing references to episode data and videos
+        # (e.g. tasks, dataset_from_index, dataset_to_index, data/chunk_index, data/file_index, etc.)
+        # This is to speedup access to these data, instead of having to load episode stats.
+        episodes = episodes.select_columns([key for key in episodes.features if not key.startswith("stats/")])
+        return episodes
+    except (FileNotFoundError, NotADirectoryError):
+        # Backward compatibility: legacy datasets may store episodes in JSONL.
+        legacy_candidates = [
+            local_dir / LEGACY_EPISODES_PATH,
+            local_dir / "episodes.jsonl",
+            local_dir / "meta" / "episodes.jsonl",
+        ]
+        legacy_path = next((p for p in legacy_candidates if p.exists()), None)
+        if legacy_path is None:
+            raise
+
+        with open(legacy_path) as f:
+            raw = [json.loads(line) for line in f if line.strip()]
+        raw = sorted(raw, key=lambda x: int(x.get("episode_index", 0)))
+
+        info = load_info(local_dir)
+        chunk_size = int(info.get("chunks_size", DEFAULT_CHUNK_SIZE))
+        video_keys = [k for k, ft in info["features"].items() if ft.get("dtype") == "video"]
+
+        rows: list[dict[str, Any]] = []
+        cursor = 0
+        for i, item in enumerate(raw):
+            ep_idx = int(item.get("episode_index", i))
+            length = int(item.get("length", 0))
+            tasks = item.get("tasks", [])
+            if isinstance(tasks, str):
+                tasks = [tasks]
+
+            ep_chunk = ep_idx // chunk_size
+            row: dict[str, Any] = {
+                "episode_index": ep_idx,
+                "tasks": tasks,
+                "length": length,
+                "dataset_from_index": cursor,
+                "dataset_to_index": cursor + length,
+                "meta/episodes/chunk_index": 0,
+                "meta/episodes/file_index": 0,
+                "data/chunk_index": ep_chunk,
+                "data/file_index": ep_idx,
+            }
+            # Preserve optional legacy metadata fields used for filtering/debugging.
+            if "robot_type" in item:
+                row["robot_type"] = item["robot_type"]
+            if "instruction" in item:
+                row["instruction"] = item["instruction"]
+            for vid_key in video_keys:
+                row[f"videos/{vid_key}/chunk_index"] = ep_chunk
+                row[f"videos/{vid_key}/file_index"] = ep_idx
+                row[f"videos/{vid_key}/from_timestamp"] = 0.0
+
+            rows.append(row)
+            cursor += length
+
+        return Dataset.from_list(rows)
 
 
 def load_image_as_numpy(
@@ -1158,12 +1313,21 @@ def validate_episode_buffer(episode_buffer: dict, total_episodes: int, features:
         )
 
 
-def to_parquet_with_hf_images(df: pandas.DataFrame, path: Path) -> None:
+def to_parquet_with_hf_images(
+    df: pandas.DataFrame, path: Path, features: datasets.Features | None = None
+) -> None:
     """This function correctly writes to parquet a panda DataFrame that contains images encoded by HF dataset.
     This way, it can be loaded by HF dataset and correctly formatted images are returned.
+
+    Args:
+        df: DataFrame to write to parquet.
+        path: Path to write the parquet file.
+        features: Optional HuggingFace Features schema. If provided, ensures image columns
+                  are properly typed as Image() in the parquet schema.
     """
     # TODO(qlhoest): replace this weird synthax by `df.to_parquet(path)` only
-    datasets.Dataset.from_dict(df.to_dict(orient="list")).to_parquet(path)
+    ds = datasets.Dataset.from_dict(df.to_dict(orient="list"), features=features)
+    ds.to_parquet(path)
 
 
 def item_to_torch(item: dict) -> dict:

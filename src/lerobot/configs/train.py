@@ -24,7 +24,7 @@ from huggingface_hub.errors import HfHubHTTPError
 
 from lerobot import envs
 from lerobot.configs import parser
-from lerobot.configs.default import DatasetConfig, EvalConfig, WandBConfig
+from lerobot.configs.default import DatasetConfig, EvalConfig, PeftConfig, WandBConfig
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.optim import OptimizerConfig
 from lerobot.optim.schedulers import LRSchedulerConfig
@@ -56,19 +56,49 @@ class TrainPipelineConfig(HubMixin):
     steps: int = 100_000
     eval_freq: int = 20_000
     log_freq: int = 200
+    tolerance_s: float = 1e-4
     save_checkpoint: bool = True
     # Checkpoint is saved every `save_freq` training iterations and after the last training step.
     save_freq: int = 20_000
+    # If set, keep only the most recent N numbered checkpoint directories under output_dir/checkpoints.
+    # Example: 1 keeps a single rolling checkpoint plus the "last" symlink.
+    keep_last_n_checkpoints: int | None = None
+    # Optional lightweight offline joint-reconstruction eval (train-set episodes).
+    # 0 disables this evaluation.
+    joint_reconstruction_num_episodes: int = 0
+    joint_reconstruction_start_episode: int = 0
+    joint_reconstruction_mode: str = "per_step"  # "per_step" or "queue_rollout"
+    # If true, run this eval at each save step. If false, run only once at end of training.
+    joint_reconstruction_eval_on_save: bool = False
+    # Optional CoT trace extraction from Qwen during joint reconstruction.
+    joint_reconstruction_extract_cot: bool = False
+    joint_reconstruction_cot_max_new_tokens: int = 64
+    joint_reconstruction_cot_every_n_steps: int = 1
+    joint_reconstruction_cot_do_sample: bool = False
+    joint_reconstruction_cot_temperature: float = 0.7
+    joint_reconstruction_cot_top_p: float = 0.9
     use_policy_training_preset: bool = True
     optimizer: OptimizerConfig | None = None
     scheduler: LRSchedulerConfig | None = None
     eval: EvalConfig = field(default_factory=EvalConfig)
     wandb: WandBConfig = field(default_factory=WandBConfig)
-    checkpoint_path: Path | None = field(init=False, default=None)
+    peft: PeftConfig | None = None
+
+    # RA-BC (Reward-Aligned Behavior Cloning) parameters
+    use_rabc: bool = False  # Enable reward-weighted training
+    rabc_progress_path: str | None = None  # Path to precomputed SARM progress parquet file
+    rabc_kappa: float = 0.01  # Hard threshold for high-quality samples
+    rabc_epsilon: float = 1e-6  # Small constant for numerical stability
+    rabc_head_mode: str | None = "sparse"  # For dual-head models: "sparse" or "dense"
+
     # Rename map for the observation to override the image and state keys
     rename_map: dict[str, str] = field(default_factory=dict)
+    checkpoint_path: Path | None = field(init=False, default=None)
 
     def validate(self) -> None:
+        # Resolve optional Dex3 selector into a concrete repo id.
+        self.dataset.repo_id = self.dataset.resolve_repo_id()
+
         # HACK: We parse again the cli args here to get the pretrained paths if there was some.
         policy_path = parser.get_path_arg("policy")
         if policy_path:
@@ -116,8 +146,39 @@ class TrainPipelineConfig(HubMixin):
             train_dir = f"{now:%Y-%m-%d}/{now:%H-%M-%S}_{self.job_name}"
             self.output_dir = Path("outputs/train") / train_dir
 
+        if not self.dataset.repo_id:
+            raise ValueError(
+                "Dataset repo_id is not configured. Set `dataset.repo_id` "
+                "or set `dataset.dex3_dataset` to a Dex3 alias/full repo id."
+            )
+
         if isinstance(self.dataset.repo_id, list):
-            raise NotImplementedError("LeRobotMultiDataset is not currently implemented.")
+            normalized_repo_ids = [str(repo).strip() for repo in self.dataset.repo_id if str(repo).strip()]
+            if len(normalized_repo_ids) == 0:
+                raise ValueError(
+                    "Dataset repo_id list is empty after normalization. "
+                    "Provide at least one valid dataset repo id."
+                )
+            self.dataset.repo_id = normalized_repo_ids
+
+        if self.keep_last_n_checkpoints is not None and self.keep_last_n_checkpoints < 1:
+            raise ValueError("keep_last_n_checkpoints must be >= 1 when provided.")
+        if self.joint_reconstruction_num_episodes < 0:
+            raise ValueError("joint_reconstruction_num_episodes must be >= 0.")
+        if self.joint_reconstruction_start_episode < 0:
+            raise ValueError("joint_reconstruction_start_episode must be >= 0.")
+        if self.joint_reconstruction_mode not in {"per_step", "queue_rollout"}:
+            raise ValueError(
+                "joint_reconstruction_mode must be one of {'per_step', 'queue_rollout'}."
+            )
+        if self.joint_reconstruction_cot_max_new_tokens < 1:
+            raise ValueError("joint_reconstruction_cot_max_new_tokens must be >= 1.")
+        if self.joint_reconstruction_cot_every_n_steps < 1:
+            raise ValueError("joint_reconstruction_cot_every_n_steps must be >= 1.")
+        if self.joint_reconstruction_cot_temperature <= 0:
+            raise ValueError("joint_reconstruction_cot_temperature must be > 0.")
+        if not (0 < self.joint_reconstruction_cot_top_p <= 1):
+            raise ValueError("joint_reconstruction_cot_top_p must be in (0, 1].")
 
         if not self.use_policy_training_preset and (self.optimizer is None or self.scheduler is None):
             raise ValueError("Optimizer and Scheduler must be set when the policy presets are not used.")
@@ -129,6 +190,19 @@ class TrainPipelineConfig(HubMixin):
             raise ValueError(
                 "'policy.repo_id' argument missing. Please specify it to push the model to the hub."
             )
+
+        if self.use_rabc and not self.rabc_progress_path:
+            # Auto-detect from dataset path
+            repo_id = self.dataset.repo_id
+            if isinstance(repo_id, list):
+                raise ValueError(
+                    "Automatic `rabc_progress_path` detection is not supported for multi-dataset runs. "
+                    "Please provide `--rabc_progress_path=...` explicitly or disable `use_rabc`."
+                )
+            if self.dataset.root:
+                self.rabc_progress_path = str(Path(self.dataset.root) / "sarm_progress.parquet")
+            else:
+                self.rabc_progress_path = f"hf://datasets/{repo_id}/sarm_progress.parquet"
 
     @classmethod
     def __get_path_fields__(cls) -> list[str]:

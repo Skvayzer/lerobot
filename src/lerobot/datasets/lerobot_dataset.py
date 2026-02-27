@@ -17,6 +17,8 @@ import contextlib
 import logging
 import shutil
 import tempfile
+import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -31,7 +33,9 @@ import torch
 import torch.utils
 from huggingface_hub import HfApi, snapshot_download
 from huggingface_hub.errors import RevisionNotFoundError
+from tqdm import tqdm
 
+from lerobot.datasets.backward_compatibility import BackwardCompatibilityError
 from lerobot.datasets.compute_stats import aggregate_stats, compute_episode_stats
 from lerobot.datasets.image_writer import AsyncImageWriter, write_image
 from lerobot.datasets.utils import (
@@ -79,6 +83,116 @@ from lerobot.utils.constants import HF_LEROBOT_HOME
 CODEBASE_VERSION = "v3.0"
 
 
+def _summarize_patterns(patterns: list[str] | str | None) -> str:
+    if patterns is None:
+        return "None"
+    if isinstance(patterns, str):
+        return patterns
+    if len(patterns) == 0:
+        return "[]"
+    preview = ", ".join(patterns[:2])
+    suffix = ", ..." if len(patterns) > 2 else ""
+    return f"{len(patterns)} paths [{preview}{suffix}]"
+
+
+def _snapshot_download_with_logging(
+    repo_id: str,
+    revision: str,
+    local_dir: Path,
+    allow_patterns: list[str] | str | None = None,
+    ignore_patterns: list[str] | str | None = None,
+) -> str:
+    expected_total_files: int | None = len(allow_patterns) if isinstance(allow_patterns, list) else None
+
+    def _count_downloaded_files() -> tuple[int, int]:
+        data_dir = local_dir / "data"
+        videos_dir = local_dir / "videos"
+        data_count = sum(1 for p in data_dir.rglob("*") if p.is_file()) if data_dir.exists() else 0
+        video_count = sum(1 for p in videos_dir.rglob("*") if p.is_file()) if videos_dir.exists() else 0
+        return data_count, video_count
+
+    logging.info(
+        "Starting snapshot_download: repo=%s, revision=%s, allow=%s, ignore=%s, expected_files=%s",
+        repo_id,
+        revision,
+        _summarize_patterns(allow_patterns),
+        _summarize_patterns(ignore_patterns),
+        expected_total_files if expected_total_files is not None else "unknown",
+    )
+
+    start_t = time.monotonic()
+    stop_event = threading.Event()
+
+    def _heartbeat() -> None:
+        while not stop_event.wait(30):
+            elapsed_s = int(time.monotonic() - start_t)
+            data_count, video_count = _count_downloaded_files()
+            downloaded = data_count + video_count
+            if expected_total_files:
+                pct = 100.0 * downloaded / expected_total_files
+                logging.info(
+                    "snapshot_download still running for '%s' (elapsed=%ss, files=%d/%d, data=%d, videos=%d, %.1f%%)",
+                    repo_id,
+                    elapsed_s,
+                    downloaded,
+                    expected_total_files,
+                    data_count,
+                    video_count,
+                    pct,
+                )
+            else:
+                logging.info(
+                    "snapshot_download still running for '%s' (elapsed=%ss, data=%d, videos=%d)",
+                    repo_id,
+                    elapsed_s,
+                    data_count,
+                    video_count,
+                )
+
+    heartbeat_thread = threading.Thread(
+        target=_heartbeat,
+        name="hf_snapshot_download_heartbeat",
+        daemon=True,
+    )
+    heartbeat_thread.start()
+
+    try:
+        local_path = snapshot_download(
+            repo_id,
+            repo_type="dataset",
+            revision=revision,
+            local_dir=local_dir,
+            allow_patterns=allow_patterns,
+            ignore_patterns=ignore_patterns,
+        )
+    finally:
+        stop_event.set()
+        heartbeat_thread.join(timeout=1.0)
+        elapsed = time.monotonic() - start_t
+        data_count, video_count = _count_downloaded_files()
+        downloaded = data_count + video_count
+        if expected_total_files:
+            logging.info(
+                "Finished snapshot_download for '%s' in %.1fs (files=%d/%d, data=%d, videos=%d)",
+                repo_id,
+                elapsed,
+                downloaded,
+                expected_total_files,
+                data_count,
+                video_count,
+            )
+        else:
+            logging.info(
+                "Finished snapshot_download for '%s' in %.1fs (data=%d, videos=%d)",
+                repo_id,
+                elapsed,
+                data_count,
+                video_count,
+            )
+
+    return local_path
+
+
 class LeRobotDatasetMetadata:
     def __init__(
         self,
@@ -102,7 +216,15 @@ class LeRobotDatasetMetadata:
             self.load_metadata()
         except (FileNotFoundError, NotADirectoryError):
             if is_valid_version(self.revision):
-                self.revision = get_safe_version(self.repo_id, self.revision)
+                try:
+                    self.revision = get_safe_version(self.repo_id, self.revision)
+                except BackwardCompatibilityError:
+                    # Fallback for legacy datasets that are not tagged with the current major:
+                    # download from main and let metadata loading decide compatibility mode.
+                    logging.warning(
+                        "Falling back to revision='main' for legacy dataset '%s'.", self.repo_id
+                    )
+                    self.revision = "main"
 
             (self.root / "meta").mkdir(exist_ok=True, parents=True)
             self.pull_from_repo(allow_patterns="meta/")
@@ -158,7 +280,17 @@ class LeRobotDatasetMetadata:
 
     def load_metadata(self):
         self.info = load_info(self.root)
-        check_version_compatibility(self.repo_id, self._version, CODEBASE_VERSION)
+        try:
+            check_version_compatibility(self.repo_id, self._version, CODEBASE_VERSION)
+        except BackwardCompatibilityError:
+            if self._version.major == 2:
+                logging.warning(
+                    "Loading legacy v%s dataset '%s' in compatibility mode.",
+                    self._version,
+                    self.repo_id,
+                )
+            else:
+                raise
         self.tasks = load_tasks(self.root)
         self.episodes = load_episodes(self.root)
         self.stats = load_stats(self.root)
@@ -168,9 +300,8 @@ class LeRobotDatasetMetadata:
         allow_patterns: list[str] | str | None = None,
         ignore_patterns: list[str] | str | None = None,
     ) -> None:
-        snapshot_download(
-            self.repo_id,
-            repo_type="dataset",
+        _snapshot_download_with_logging(
+            repo_id=self.repo_id,
             revision=self.revision,
             local_dir=self.root,
             allow_patterns=allow_patterns,
@@ -194,9 +325,15 @@ class LeRobotDatasetMetadata:
                 f"Episode index {ep_index} out of range. Episodes: {len(self.episodes) if self.episodes else 0}"
             )
         ep = self.episodes[ep_index]
-        chunk_idx = ep["data/chunk_index"]
-        file_idx = ep["data/file_index"]
-        fpath = self.data_path.format(chunk_index=chunk_idx, file_index=file_idx)
+        chunk_idx = ep["data/chunk_index"] if "data/chunk_index" in ep else ep_index // self.chunks_size
+        file_idx = ep["data/file_index"] if "data/file_index" in ep else ep_index
+        format_kwargs = {
+            "chunk_index": chunk_idx,
+            "file_index": file_idx,
+            "episode_chunk": chunk_idx,
+            "episode_index": ep_index,
+        }
+        fpath = self.data_path.format(**format_kwargs)
         return Path(fpath)
 
     def get_video_file_path(self, ep_index: int, vid_key: str) -> Path:
@@ -207,9 +344,18 @@ class LeRobotDatasetMetadata:
                 f"Episode index {ep_index} out of range. Episodes: {len(self.episodes) if self.episodes else 0}"
             )
         ep = self.episodes[ep_index]
-        chunk_idx = ep[f"videos/{vid_key}/chunk_index"]
-        file_idx = ep[f"videos/{vid_key}/file_index"]
-        fpath = self.video_path.format(video_key=vid_key, chunk_index=chunk_idx, file_index=file_idx)
+        chunk_key = f"videos/{vid_key}/chunk_index"
+        file_key = f"videos/{vid_key}/file_index"
+        chunk_idx = ep[chunk_key] if chunk_key in ep else ep_index // self.chunks_size
+        file_idx = ep[file_key] if file_key in ep else ep_index
+        format_kwargs = {
+            "video_key": vid_key,
+            "chunk_index": chunk_idx,
+            "file_index": file_idx,
+            "episode_chunk": chunk_idx,
+            "episode_index": ep_index,
+        }
+        fpath = self.video_path.format(**format_kwargs)
         return Path(fpath)
 
     @property
@@ -790,9 +936,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
         allow_patterns: list[str] | str | None = None,
         ignore_patterns: list[str] | str | None = None,
     ) -> None:
-        snapshot_download(
-            self.repo_id,
-            repo_type="dataset",
+        _snapshot_download_with_logging(
+            repo_id=self.repo_id,
             revision=self.revision,
             local_dir=self.root,
             allow_patterns=allow_patterns,
@@ -810,21 +955,47 @@ class LeRobotDataset(torch.utils.data.Dataset):
         ignore_patterns = None if download_videos else "videos/"
         files = None
         if self.episodes is not None:
-            files = self.get_episodes_file_paths()
+            files = self.get_episodes_file_paths(show_progress=True)
+        else:
+            logging.info(
+                "Downloading full dataset '%s' (episodes=%d, videos=%s).",
+                self.repo_id,
+                self.meta.total_episodes,
+                download_videos,
+            )
         self.pull_from_repo(allow_patterns=files, ignore_patterns=ignore_patterns)
 
-    def get_episodes_file_paths(self) -> list[Path]:
+    def get_episodes_file_paths(self, show_progress: bool = False) -> list[str]:
         episodes = self.episodes if self.episodes is not None else list(range(self.meta.total_episodes))
-        fpaths = [str(self.meta.get_data_file_path(ep_idx)) for ep_idx in episodes]
-        if len(self.meta.video_keys) > 0:
-            video_files = [
-                str(self.meta.get_video_file_path(ep_idx, vid_key))
-                for vid_key in self.meta.video_keys
-                for ep_idx in episodes
-            ]
-            fpaths += video_files
-        # episodes are stored in the same files, so we return unique paths only
-        fpaths = list(set(fpaths))
+        episodes_iter = episodes
+        if show_progress:
+            episodes_iter = tqdm(
+                episodes,
+                desc=f"Resolving subset files for {self.repo_id}",
+                unit="episode",
+            )
+
+        data_files: set[str] = set()
+        video_files: set[str] = set()
+        has_videos = len(self.meta.video_keys) > 0
+
+        for ep_idx in episodes_iter:
+            data_files.add(str(self.meta.get_data_file_path(ep_idx)))
+            if has_videos:
+                for vid_key in self.meta.video_keys:
+                    video_files.add(str(self.meta.get_video_file_path(ep_idx, vid_key)))
+
+        fpaths = sorted(data_files | video_files)
+        if show_progress:
+            logging.info(
+                "Subset download plan for '%s': episodes=%d/%d, data_files=%d, video_files=%d, total_files=%d",
+                self.repo_id,
+                len(episodes),
+                self.meta.total_episodes,
+                len(data_files),
+                len(video_files),
+                len(fpaths),
+            )
         return fpaths
 
     def load_hf_dataset(self) -> datasets.Dataset:
@@ -958,7 +1129,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
             # Episodes are stored sequentially on a single mp4 to reduce the number of files.
             # Thus we load the start timestamp of the episode on this mp4 and,
             # shift the query timestamp accordingly.
-            from_timestamp = ep[f"videos/{vid_key}/from_timestamp"]
+            from_timestamp = ep.get(f"videos/{vid_key}/from_timestamp", 0.0)
             shifted_query_ts = [from_timestamp + ts for ts in query_ts]
 
             video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)

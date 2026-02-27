@@ -41,11 +41,15 @@ class CompatibilityError(Exception): ...
 
 class BackwardCompatibilityError(CompatibilityError):
     def __init__(self, repo_id: str, version: packaging.version.Version):
-        if version.major == 2 and version.minor == 1:
+        # Treat all 2.x dataset versions as requiring v2.1 -> v3.0 conversion guidance.
+        # Some hub repos expose tags like v2.0/v2.2 while still needing the same migration path.
+        if version.major == 2:
             message = V30_MESSAGE.format(repo_id=repo_id, version=version)
         else:
-            raise NotImplementedError(
-                "Contact the maintainer on [Discord](https://discord.com/invite/s3KuuzsPFb)."
+            message = (
+                f"The dataset you requested ({repo_id}) is in {version} format, "
+                "which is not backward compatible with this codebase major version. "
+                "Please use a dataset revision matching your lerobot major version."
             )
         super().__init__(message)
 

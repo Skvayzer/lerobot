@@ -20,8 +20,6 @@ import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import nn
 from torch.distributions import Beta
-from torch.distributions import Beta
-from peft import LoraConfig, get_peft_model, PeftModel
 
 from lerobot.utils.import_utils import _transformers_available
 
@@ -143,6 +141,10 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
     tune_diffusion_model: bool = field(
         default=True, metadata={"help": "Whether to tune the diffusion model."}
     )
+    tune_vlln: bool = field(
+        default=True,
+        metadata={"help": "Whether to tune visual-language normalization/adapter blocks."},
+    )
     load_pretrained_det_decode_layer_path: str = field(
         default=None, metadata={"help": "Path to pretrained detection model."}
     )
@@ -154,6 +156,13 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
 
     vl_self_attention_cfg: dict = field(default=None)
     num_target_vision_tokens: int = field(default=32, metadata={"help": "Number of target vision tokens."})
+    # Optional extra observation vectors (e.g., IMU, odometry, tactile) projected into state token.
+    extra_observation_dims: dict[str, int] = field(default_factory=dict)
+    # Optional joint split for weighted action reconstruction loss.
+    upper_body_joint_indices: list[int] = field(default_factory=list)
+    lower_body_joint_indices: list[int] = field(default_factory=list)
+    upper_body_loss_weight: float = field(default=1.0)
+    lower_body_loss_weight: float = field(default=0.0)
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -168,6 +177,7 @@ class FlowmatchingActionHead(nn.Module):
     def __init__(
         self,
         config: FlowmatchingActionHeadConfig,
+        lora_config: dict | None = None,
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -195,6 +205,34 @@ class FlowmatchingActionHead(nn.Module):
             hidden_dim=self.hidden_size,
             output_dim=self.action_dim,
         )
+
+        self.extra_observation_dims: dict[str, int] = {}
+        self._extra_obs_key_to_module_key: dict[str, str] = {}
+        self.extra_observation_projectors = nn.ModuleDict()
+        # Older pretrained configs may not carry this newly added field yet.
+        extra_observation_dims_cfg = getattr(config, "extra_observation_dims", None)
+        if not isinstance(extra_observation_dims_cfg, dict):
+            extra_observation_dims_cfg = {}
+        for obs_key, raw_dim in sorted(extra_observation_dims_cfg.items()):
+            try:
+                obs_dim = int(raw_dim)
+            except (TypeError, ValueError):
+                continue
+            if obs_dim <= 0:
+                continue
+            module_key = obs_key.replace(".", "__")
+            self.extra_observation_dims[obs_key] = obs_dim
+            self._extra_obs_key_to_module_key[obs_key] = module_key
+            self.extra_observation_projectors[module_key] = nn.Sequential(
+                nn.LayerNorm(obs_dim),
+                nn.Linear(obs_dim, self.input_embedding_dim),
+            )
+        if self.extra_observation_dims:
+            print(
+                "[FlowmatchingActionHead] Extra observation projectors initialized for keys: "
+                f"{sorted(self.extra_observation_dims.keys())}"
+            )
+
         self.future_tokens = nn.Embedding(config.num_target_vision_tokens, self.input_embedding_dim)
         nn.init.normal_(self.future_tokens.weight, mean=0.0, std=0.02)
 
@@ -210,43 +248,84 @@ class FlowmatchingActionHead(nn.Module):
         self.beta_dist = Beta(config.noise_beta_alpha, config.noise_beta_beta)
         self.num_timestep_buckets = config.num_timestep_buckets
         self.config = config
-        self.set_trainable_parameters(config.tune_projector, config.tune_diffusion_model)
+        self._configure_joint_loss_split()
+        
+        # Apply LoRA if configured
+        self.lora_config = lora_config
+        if self.lora_config is not None and self.lora_config.get("r", 0) > 0:
+            try:
+                from peft import LoraConfig, get_peft_model, TaskType
+                # Convert dict to LoraConfig object
+                peft_config = LoraConfig(
+                    r=self.lora_config.get("r"),
+                    lora_alpha=self.lora_config.get("lora_alpha", 16),
+                    lora_dropout=self.lora_config.get("lora_dropout", 0.05),
+                    target_modules=self.lora_config.get("target_modules"),
+                    bias="none",
+                    task_type=None, 
+                )
+                
+                print(f"[FlowmatchingActionHead] Applying LoRA to DiT with config: {peft_config}")
+                self.model = get_peft_model(self.model, peft_config)
+                self.model.print_trainable_parameters()
+            except ImportError:
+                print("[FlowmatchingActionHead] Warning: peft not installed, cannot apply LoRA.")
+        
+        self.set_trainable_parameters(
+            config.tune_projector,
+            config.tune_diffusion_model,
+            tune_vlln=getattr(config, "tune_vlln", True),
+        )
 
     def set_trainable_parameters(
         self,
         tune_projector: bool,
         tune_diffusion_model: bool,
+        tune_vlln: bool | None = None,
         lora_config: dict | None = None,
     ):
         self.tune_projector = tune_projector
         self.tune_diffusion_model = tune_diffusion_model
-        lora_config = lora_config or {}
+        self.tune_vlln = getattr(self.config, "tune_vlln", True) if tune_vlln is None else bool(tune_vlln)
 
+        # Preserve backwards compatibility for callers that still pass lora_config here.
+        del lora_config
+
+        is_peft = hasattr(self.model, "peft_config")
+
+        # Strict staged training semantics: freeze everything first, then whitelist trainable blocks.
         for p in self.parameters():
-            p.requires_grad = True
-        if not tune_projector:
-            self.state_encoder.requires_grad_(False)
-            self.action_encoder.requires_grad_(False)
-            self.action_decoder.requires_grad_(False)
+            p.requires_grad = False
+
+        if tune_projector:
+            self.state_encoder.requires_grad_(True)
+            self.action_encoder.requires_grad_(True)
+            self.action_decoder.requires_grad_(True)
+            self.extra_observation_projectors.requires_grad_(True)
+            self.future_tokens.requires_grad_(True)
             if self.config.add_pos_embed:
-                self.position_embedding.requires_grad_(False)
-        if not tune_diffusion_model:
+                self.position_embedding.requires_grad_(True)
+
+        # vlln/vl_self_attention are orthogonal to projector and diffusion toggles.
+        if self.config.use_vlln and self.tune_vlln:
+            self.vlln.requires_grad_(True)
+            self.vl_self_attention.requires_grad_(True)
+
+        if tune_diffusion_model:
+            if is_peft:
+                # Keep only adapter params trainable in PEFT mode.
+                for name, p in self.model.named_parameters():
+                    if ("lora_" in name) or ("modules_to_save" in name):
+                        p.requires_grad = True
+            else:
+                self.model.requires_grad_(True)
+        else:
             self.model.requires_grad_(False)
-        
-        # Apply LoRA if requested and we are tuning the diffusion model
-        if tune_diffusion_model and lora_config.get("r", 0) > 0 and not isinstance(self.model, PeftModel):
-            print(f"Applying LoRA to Action Head DiT with config: {lora_config}")
-            peft_config = LoraConfig(**lora_config)
-            self.model = get_peft_model(self.model, peft_config)
-            self.model.print_trainable_parameters()
 
         print(f"Tune action head projector: {self.tune_projector}")
-        print(f"Tune action head diffusion model: {self.tune_diffusion_model}")
-        # Check if any parameters are still trainable. If not, print a warning.
-        if not tune_projector and not tune_diffusion_model:
-            for name, p in self.named_parameters():
-                if p.requires_grad:
-                    print(f"Action head trainable parameter: {name}")
+        print(f"Tune action head vlln: {self.tune_vlln and self.config.use_vlln}")
+        print(f"Tune action head diffusion model: {self.tune_diffusion_model} (LoRA: {is_peft})")
+
         if not any(p.requires_grad for p in self.parameters()):
             print("Warning: No action head trainable parameters found.")
 
@@ -261,19 +340,110 @@ class FlowmatchingActionHead(nn.Module):
                 self.state_encoder.eval()
                 self.action_encoder.eval()
                 self.action_decoder.eval()
+                self.extra_observation_projectors.eval()
+                self.future_tokens.eval()
                 if self.config.add_pos_embed:
                     self.position_embedding.eval()
+            if self.config.use_vlln and not self.tune_vlln:
+                self.vlln.eval()
+                self.vl_self_attention.eval()
             if not self.tune_diffusion_model:
                 self.model.eval()
 
+    @staticmethod
+    def _normalize_joint_indices(indices: list[int] | None, action_dim: int, name: str) -> list[int]:
+        normalized: list[int] = []
+        if not indices:
+            return normalized
+
+        for raw_idx in indices:
+            try:
+                idx = int(raw_idx)
+            except (TypeError, ValueError):
+                print(f"[FlowmatchingActionHead] Ignoring non-integer index in {name}: {raw_idx}")
+                continue
+            if idx < 0:
+                print(f"[FlowmatchingActionHead] Ignoring negative index in {name}: {idx}")
+                continue
+            if idx >= action_dim:
+                print(
+                    "[FlowmatchingActionHead] Ignoring out-of-range index in "
+                    f"{name}: {idx} (action_dim={action_dim})"
+                )
+                continue
+            normalized.append(idx)
+        return sorted(set(normalized))
+
+    def _configure_joint_loss_split(self) -> None:
+        action_dim = int(self.action_dim)
+        upper_weight = float(getattr(self.config, "upper_body_loss_weight", 1.0))
+        lower_weight = float(getattr(self.config, "lower_body_loss_weight", 0.0))
+        upper_indices = self._normalize_joint_indices(
+            getattr(self.config, "upper_body_joint_indices", []), action_dim, "upper_body_joint_indices"
+        )
+        lower_indices = self._normalize_joint_indices(
+            getattr(self.config, "lower_body_joint_indices", []), action_dim, "lower_body_joint_indices"
+        )
+
+        overlap = sorted(set(upper_indices).intersection(lower_indices))
+        if overlap:
+            raise ValueError(
+                "upper_body_joint_indices and lower_body_joint_indices overlap in FlowmatchingActionHead: "
+                f"{overlap}"
+            )
+
+        both_sets_provided = bool(upper_indices) and bool(lower_indices)
+        upper_selector = torch.zeros(action_dim, dtype=torch.float32)
+        lower_selector = torch.zeros(action_dim, dtype=torch.float32)
+
+        if both_sets_provided:
+            upper_selector[upper_indices] = 1.0
+            lower_selector[lower_indices] = 1.0
+        elif upper_indices:
+            upper_selector[upper_indices] = 1.0
+            lower_selector = 1.0 - upper_selector
+        elif lower_indices:
+            lower_selector[lower_indices] = 1.0
+            upper_selector = 1.0 - lower_selector
+        else:
+            upper_selector[:] = 1.0
+            lower_selector[:] = 0.0
+
+        if upper_weight < 0.0 or lower_weight < 0.0:
+            raise ValueError(
+                "upper_body_loss_weight and lower_body_loss_weight must be non-negative. "
+                f"Got ({upper_weight}, {lower_weight})."
+            )
+        if upper_weight == 0.0 and lower_weight == 0.0:
+            raise ValueError("At least one of upper_body_loss_weight or lower_body_loss_weight must be > 0.")
+
+        self.upper_body_loss_weight = upper_weight
+        self.lower_body_loss_weight = lower_weight
+        self.upper_body_joint_indices = upper_indices
+        self.lower_body_joint_indices = lower_indices
+        self.register_buffer("_upper_joint_selector", upper_selector.view(1, 1, -1), persistent=False)
+        self.register_buffer("_lower_joint_selector", lower_selector.view(1, 1, -1), persistent=False)
+
+        print(
+            "[FlowmatchingActionHead] Joint loss split: "
+            f"upper_dims={int(upper_selector.sum().item())}, "
+            f"lower_dims={int(lower_selector.sum().item())}, "
+            f"upper_weight={self.upper_body_loss_weight}, "
+            f"lower_weight={self.lower_body_loss_weight}"
+        )
+        if upper_indices or lower_indices:
+            print(
+                "[FlowmatchingActionHead] Joint index sets: "
+                f"upper={upper_indices}, lower={lower_indices}"
+            )
+
     def sample_time(self, batch_size, device, dtype):
-        # Beta/Dirichlet sampling is not implemented for BFloat16 in PyTorch
-        # So we force float32 for the sampling process
+        # Beta/Dirichlet sampling is not implemented for bfloat16 in PyTorch.
+        # Match original groot behavior: sample in fp32, then cast.
         alpha = torch.tensor(self.config.noise_beta_alpha, device=device, dtype=torch.float32)
         beta = torch.tensor(self.config.noise_beta_beta, device=device, dtype=torch.float32)
         dist = Beta(alpha, beta)
-        
-        sample = dist.sample([batch_size]).to(dtype=dtype)
+        sample = dist.sample([batch_size]).to(device=device, dtype=dtype)
         return (self.config.noise_s - sample) / self.config.noise_s
 
     def prepare_input(self, batch: dict) -> BatchFeature:
@@ -285,6 +455,50 @@ class FlowmatchingActionHead(nn.Module):
         backbone_features = self.vl_self_attention(backbone_features)
         backbone_output["backbone_features"] = backbone_features
         return backbone_output
+
+    def _encode_extra_observations(self, action_input: BatchFeature, target_dtype: torch.dtype) -> torch.Tensor | None:
+        if not self.extra_observation_projectors:
+            return None
+
+        accum: torch.Tensor | None = None
+        count = 0
+        device = action_input.state.device
+
+        for obs_key, module_key in self._extra_obs_key_to_module_key.items():
+            if obs_key not in action_input:
+                continue
+
+            obs_tensor = action_input[obs_key]
+            if not isinstance(obs_tensor, torch.Tensor):
+                continue
+
+            if obs_tensor.dim() == 1:
+                obs_tensor = obs_tensor.unsqueeze(0)
+            elif obs_tensor.dim() == 3 and obs_tensor.shape[1] == 1:
+                obs_tensor = obs_tensor[:, 0, :]
+            elif obs_tensor.dim() > 2:
+                obs_tensor = obs_tensor.reshape(obs_tensor.shape[0], -1)
+
+            obs_tensor = obs_tensor.to(device=device, dtype=torch.float32)
+
+            expected_dim = self.extra_observation_dims[obs_key]
+            if obs_tensor.shape[-1] > expected_dim:
+                obs_tensor = obs_tensor[:, :expected_dim]
+            elif obs_tensor.shape[-1] < expected_dim:
+                pad = torch.zeros(
+                    (obs_tensor.shape[0], expected_dim - obs_tensor.shape[-1]),
+                    dtype=obs_tensor.dtype,
+                    device=obs_tensor.device,
+                )
+                obs_tensor = torch.cat([obs_tensor, pad], dim=1)
+
+            encoded = self.extra_observation_projectors[module_key](obs_tensor).to(dtype=target_dtype)
+            accum = encoded if accum is None else accum + encoded
+            count += 1
+
+        if accum is None or count == 0:
+            return None
+        return (accum / float(count)).unsqueeze(1)
 
     def forward(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
         # Set frozen modules to eval
@@ -320,6 +534,9 @@ class FlowmatchingActionHead(nn.Module):
 
         # Embed state.
         state_features = self.state_encoder(action_input.state, embodiment_id)
+        extra_state_features = self._encode_extra_observations(action_input, target_dtype=state_features.dtype)
+        if extra_state_features is not None:
+            state_features = state_features + extra_state_features
 
         # Embed noised action trajectory.
         actions = action_input.action
@@ -356,12 +573,59 @@ class FlowmatchingActionHead(nn.Module):
         pred = self.action_decoder(model_output, embodiment_id)
         pred_actions = pred[:, -actions.shape[1] :]
 
-        # Slice out only the action portion of pred and target.
-        action_mask = action_input.action_mask
-        loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
-        loss = loss.sum() / action_mask.sum()
+        # Weighted split loss: upper-body and lower-body joints.
+        action_mask = action_input.action_mask.to(dtype=pred_actions.dtype)
+        mse = F.mse_loss(pred_actions, velocity, reduction="none")
+
+        upper_selector = self._upper_joint_selector.to(device=pred_actions.device, dtype=pred_actions.dtype)
+        lower_selector = self._lower_joint_selector.to(device=pred_actions.device, dtype=pred_actions.dtype)
+        upper_mask = action_mask * upper_selector
+        lower_mask = action_mask * lower_selector
+
+        upper_denom = upper_mask.sum()
+        lower_denom = lower_mask.sum()
+
+        zero = mse.new_zeros(())
+        upper_loss = (mse * upper_mask).sum() / upper_denom if upper_denom.item() > 0 else zero
+        lower_loss = (mse * lower_mask).sum() / lower_denom if lower_denom.item() > 0 else zero
+        loss = (
+            self.upper_body_loss_weight * upper_loss
+            + self.lower_body_loss_weight * lower_loss
+        )
+
+        if upper_denom.item() == 0 and self.upper_body_loss_weight > 0:
+            print(
+                "[GROOT][DEBUG] upper-body loss mask is empty; "
+                f"upper_selector_sum={upper_selector.sum().detach().float().cpu().item()}, "
+                f"action_mask_sum={action_mask.sum().detach().float().cpu().item()}"
+            )
+        if lower_denom.item() == 0 and self.lower_body_loss_weight > 0:
+            print(
+                "[GROOT][DEBUG] lower-body loss mask is empty; "
+                f"lower_selector_sum={lower_selector.sum().detach().float().cpu().item()}, "
+                f"action_mask_sum={action_mask.sum().detach().float().cpu().item()}"
+            )
+        if torch.isnan(loss):
+            with torch.no_grad():
+                print(
+                    "[GROOT][DEBUG] NaN loss detected.",
+                    f"upper_loss={upper_loss.detach().float().cpu().item()}",
+                    f"lower_loss={lower_loss.detach().float().cpu().item()}",
+                    f"upper_denom={upper_denom.detach().float().cpu().item()}",
+                    f"lower_denom={lower_denom.detach().float().cpu().item()}",
+                    f"pred_actions_stats=(min={pred_actions.min().detach().float().cpu().item()}, "
+                    f"max={pred_actions.max().detach().float().cpu().item()}, "
+                    f"mean={pred_actions.mean().detach().float().cpu().item()})",
+                    f"velocity_stats=(min={velocity.min().detach().float().cpu().item()}, "
+                    f"max={velocity.max().detach().float().cpu().item()}, "
+                    f"mean={velocity.mean().detach().float().cpu().item()})",
+                )
         output_dict = {
             "loss": loss,
+            "loss_upper": upper_loss.detach(),
+            "loss_lower": lower_loss.detach(),
+            "loss_upper_weighted": (self.upper_body_loss_weight * upper_loss).detach(),
+            "loss_lower_weighted": (self.lower_body_loss_weight * lower_loss).detach(),
         }
         return BatchFeature(data=output_dict)
 
@@ -375,6 +639,9 @@ class FlowmatchingActionHead(nn.Module):
 
         # Embed state.
         state_features = self.state_encoder(action_input.state, embodiment_id)
+        extra_state_features = self._encode_extra_observations(action_input, target_dtype=state_features.dtype)
+        if extra_state_features is not None:
+            state_features = state_features + extra_state_features
 
         # Set initial actions as the sampled noise.
         batch_size = vl_embs.shape[0]

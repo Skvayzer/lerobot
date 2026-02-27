@@ -62,6 +62,13 @@ class GrootConfig(PreTrainedConfig):
     # Embodiment tag to use for training (e.g. 'new_embodiment', 'gr1')
     embodiment_tag: str = "new_embodiment"
 
+    # Optional state inference from observation keys when dataset does not provide observation.state
+    # If None, a heuristic will concatenate all 1D observation tensors (excluding images).
+    infer_state_from_obs: bool = True
+    state_keys: list[str] | None = None
+    state_key_regex: str | None = None
+    state_key_exclude_regex: str | None = None
+
     # Fine-tuning control arguments
 
     # Whether to fine-tune the llm backbone

@@ -13,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import shutil
 from pathlib import Path
 
 from torch.optim import Optimizer
@@ -60,6 +61,33 @@ def update_last_checkpoint(checkpoint_dir: Path) -> Path:
         last_checkpoint_dir.unlink()
     relative_target = checkpoint_dir.relative_to(checkpoint_dir.parent)
     last_checkpoint_dir.symlink_to(relative_target)
+
+
+def prune_old_checkpoints(checkpoints_dir: Path, keep_last_n: int | None) -> list[Path]:
+    """
+    Delete old numbered checkpoint directories, keeping only the latest N.
+
+    This never deletes the `last` symlink and only considers numeric checkpoint directories
+    like `000500`, `010000`, etc.
+    """
+    if keep_last_n is None:
+        return []
+
+    ckpt_dirs = sorted(
+        [
+            p
+            for p in checkpoints_dir.iterdir()
+            if p.is_dir() and not p.is_symlink() and p.name.isdigit()
+        ],
+        key=lambda p: p.name,
+    )
+    if len(ckpt_dirs) <= keep_last_n:
+        return []
+
+    to_remove = ckpt_dirs[:-keep_last_n]
+    for old_dir in to_remove:
+        shutil.rmtree(old_dir)
+    return to_remove
 
 
 def save_checkpoint(
