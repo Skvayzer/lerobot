@@ -20,6 +20,17 @@ from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from lerobot.optim.optimizers import AdamWConfig
 from lerobot.optim.schedulers import CosineDecayWithWarmupSchedulerConfig
+from lerobot.policies.grootCoT.system2_vlm_registry import (
+    DEFAULT_SYSTEM2_VLM_MODEL_ID,
+    DEFAULT_SYSTEM2_VLM_PRESET,
+    resolve_system2_vlm_model_id,
+    validate_system2_vlm_preset,
+)
+
+DEFAULT_PRIMARY_ACTION_GROUP_INDICES = list(range(14))
+DEFAULT_SECONDARY_ACTION_GROUP_INDICES = list(range(14, 28))
+DEFAULT_PRIMARY_ACTION_GROUP_LOSS_WEIGHT = 1.0
+DEFAULT_SECONDARY_ACTION_GROUP_LOSS_WEIGHT = 1.0
 
 
 @PreTrainedConfig.register_subclass("groot_cot")
@@ -58,8 +69,16 @@ class GrootCoTConfig(PreTrainedConfig):
 
     # HF repo ID (or local path) that hosts vocab.json and merges.txt for Eagle tokenizer.
     tokenizer_assets_repo: str = "lerobot/eagle2hg-processor-groot-n1p5"
-    # Vision-language processor/model ID for Qwen-based backbone
-    vlm_processor_model_id: str = "Qwen/Qwen3-VL-8B-Thinking"
+    # Explicit System-2 VLM selector:
+    # - system2_vlm_model_id: direct HF model id (highest priority)
+    # - system2_vlm_preset: registry preset (second priority)
+    # - vlm_processor_model_id: legacy field (third priority; retained for compatibility)
+    system2_vlm_preset: str = DEFAULT_SYSTEM2_VLM_PRESET
+    system2_vlm_model_id: str | None = None
+    vlm_processor_model_id: str = DEFAULT_SYSTEM2_VLM_MODEL_ID
+    # Resolved canonical model id and resolution source for logging/debug.
+    resolved_system2_vlm_model_id: str = field(default="", init=False)
+    resolved_system2_vlm_source: str = field(default="", init=False)
     
     # Attention implementation for Qwen VLM backbone ("eager", "sdpa", or "flash_attention_2")
     # Use "eager" if experiencing NaN issues with flash attention
@@ -93,16 +112,29 @@ class GrootCoTConfig(PreTrainedConfig):
     # - "error": fail fast if any canonical camera is missing.
     dex3_missing_camera_policy: str = "zero_fill"
 
-    # Optional joint split for weighted action loss.
-    # If only upper indices are provided, lower is treated as complement.
-    # If only lower indices are provided, upper is treated as complement.
-    # If both are empty, all joints are treated as upper.
+    # Optional action-group split for weighted action loss.
+    # If only primary indices are provided, secondary is treated as complement.
+    # If only secondary indices are provided, primary is treated as complement.
+    # If both are empty, all joints are treated as primary.
     # Default split matches current 28-dim G1 action packing used in this project:
-    # first 14 dims (upper group), last 14 dims (lower group).
-    upper_body_joint_indices: list[int] = field(default_factory=lambda: list(range(14)))
-    lower_body_joint_indices: list[int] = field(default_factory=lambda: list(range(14, 28)))
-    upper_body_loss_weight: float = 1.0
-    lower_body_loss_weight: float = 1.0
+    # first 14 dims (primary group), last 14 dims (secondary group).
+    primary_action_group_indices: list[int] = field(
+        default_factory=lambda: list(DEFAULT_PRIMARY_ACTION_GROUP_INDICES)
+    )
+    secondary_action_group_indices: list[int] = field(
+        default_factory=lambda: list(DEFAULT_SECONDARY_ACTION_GROUP_INDICES)
+    )
+    primary_action_group_loss_weight: float = DEFAULT_PRIMARY_ACTION_GROUP_LOSS_WEIGHT
+    secondary_action_group_loss_weight: float = DEFAULT_SECONDARY_ACTION_GROUP_LOSS_WEIGHT
+    # Legacy aliases retained for backward compatibility with old configs/checkpoints.
+    upper_body_joint_indices: list[int] = field(
+        default_factory=lambda: list(DEFAULT_PRIMARY_ACTION_GROUP_INDICES)
+    )
+    lower_body_joint_indices: list[int] = field(
+        default_factory=lambda: list(DEFAULT_SECONDARY_ACTION_GROUP_INDICES)
+    )
+    upper_body_loss_weight: float = DEFAULT_PRIMARY_ACTION_GROUP_LOSS_WEIGHT
+    lower_body_loss_weight: float = DEFAULT_SECONDARY_ACTION_GROUP_LOSS_WEIGHT
 
     # Fine-tuning control arguments
 
@@ -172,7 +204,10 @@ class GrootCoTConfig(PreTrainedConfig):
     optimizer_eps: float = 1e-8
     optimizer_weight_decay: float = 1e-5
     warmup_ratio: float = 0.05
+    # Legacy compatibility fields retained so old checkpoint configs can be loaded.
+    use_amp: bool = False
     use_bf16: bool = True
+    use_peft: bool = False
 
     # Dataset parameters
     # Video backend to use for training ('decord' or 'torchvision_av')
@@ -212,10 +247,48 @@ class GrootCoTConfig(PreTrainedConfig):
     system1_min_queue_size: int = 0
     # Reset-time behavior for cached System-2 latents.
     dual_rate_force_backbone_refresh_on_reset: bool = True
+    # Optional non-blocking async System-2 updates for inference/eval.
+    # When enabled, System-2 chunk generation runs in a background thread
+    # scheduled by wall-clock `system2_hz`, while System-1 keeps emitting actions.
+    system2_async_enable: bool = False
+    # Max number of precomputed chunks buffered from async System-2 worker.
+    system2_async_prefetch_chunks: int = 1
+    # If True, block once at startup until first async chunk is ready.
+    # Keep False to avoid blocking control loop.
+    system2_async_startup_warmup: bool = False
+    # Drop stale observation snapshots older than this threshold in async worker.
+    system2_async_max_observation_age_s: float = 0.5
+    # Async worker diagnostic log interval (in select_action control steps).
+    system2_async_log_every_n_steps: int = 100
+    # Explicitly mark async scheduling policy (currently wall-clock only).
+    system2_async_wall_clock: bool = True
+
+    # RECAP-style improvement conditioning.
+    recap_enable: bool = False
+    recap_adv_indicator_key: str = "observation.extra.adv_indicator"
+    recap_adv_indicator_null_value: float = -1.0
+    recap_adv_indicator_cond_value: float = 1.0
+    # Classifier-free style dropout probability for indicator conditioning.
+    recap_adv_indicator_dropout_p: float = 0.3
+    # Optional labels sidecar (parquet/jsonl) keyed by dataset index for offline fine-tuning.
+    recap_labels_path: str | None = None
+    # Optional CFG at inference for velocity predictions.
+    recap_adv_indicator_use_cfg: bool = False
+    recap_cfg_scale: float = 1.0
+
+    # Value head on top of System-2 (Qwen) embeddings.
+    recap_value_head_enable: bool = False
+    recap_tune_value_head: bool = True
+    recap_value_head_bins: int = 201
+    recap_value_head_vmin: float = -1.0
+    recap_value_head_vmax: float = 0.0
+    # One of {"masked_mean", "last_token"}.
+    recap_value_head_pooling: str = "masked_mean"
 
     def __post_init__(self):
         super().__post_init__()
         self._apply_training_stage_preset()
+        self._resolve_system2_vlm()
 
         if self.n_action_steps > self.chunk_size:
             raise ValueError(
@@ -229,12 +302,6 @@ class GrootCoTConfig(PreTrainedConfig):
             )
         if len(self.dex3_canonical_camera_order) == 0:
             raise ValueError("dex3_canonical_camera_order must contain at least one camera key.")
-        if self.upper_body_loss_weight < 0.0:
-            raise ValueError("upper_body_loss_weight must be >= 0.")
-        if self.lower_body_loss_weight < 0.0:
-            raise ValueError("lower_body_loss_weight must be >= 0.")
-        if self.upper_body_loss_weight == 0.0 and self.lower_body_loss_weight == 0.0:
-            raise ValueError("At least one of upper_body_loss_weight or lower_body_loss_weight must be > 0.")
         if self.control_hz <= 0:
             raise ValueError("control_hz must be > 0.")
         if self.system2_hz <= 0:
@@ -245,6 +312,24 @@ class GrootCoTConfig(PreTrainedConfig):
             raise ValueError("system1_replan_every_n_steps must be >= 0.")
         if self.system1_min_queue_size < 0:
             raise ValueError("system1_min_queue_size must be >= 0.")
+        if self.system2_async_prefetch_chunks < 1:
+            raise ValueError("system2_async_prefetch_chunks must be >= 1.")
+        if self.system2_async_max_observation_age_s <= 0.0:
+            raise ValueError("system2_async_max_observation_age_s must be > 0.")
+        if self.system2_async_log_every_n_steps < 1:
+            raise ValueError("system2_async_log_every_n_steps must be >= 1.")
+        if not (0.0 <= self.recap_adv_indicator_dropout_p <= 1.0):
+            raise ValueError("recap_adv_indicator_dropout_p must be in [0, 1].")
+        if self.recap_value_head_bins < 2:
+            raise ValueError("recap_value_head_bins must be >= 2.")
+        if self.recap_value_head_vmax <= self.recap_value_head_vmin:
+            raise ValueError("recap_value_head_vmax must be > recap_value_head_vmin.")
+        if self.recap_value_head_pooling not in {"masked_mean", "last_token"}:
+            raise ValueError(
+                "recap_value_head_pooling must be one of {'masked_mean', 'last_token'}."
+            )
+        if self.recap_cfg_scale < 0.0:
+            raise ValueError("recap_cfg_scale must be >= 0.")
 
         def _normalize_joint_indices(indices: list[int], name: str) -> list[int]:
             normalized: list[int] = []
@@ -258,21 +343,140 @@ class GrootCoTConfig(PreTrainedConfig):
                 normalized.append(value)
             return sorted(set(normalized))
 
-        self.upper_body_joint_indices = _normalize_joint_indices(
-            self.upper_body_joint_indices, "upper_body_joint_indices"
+        def _is_non_default_list(value: list[int], default_value: list[int]) -> bool:
+            return list(value) != list(default_value)
+
+        def _is_non_default_float(value: float, default_value: float) -> bool:
+            return float(value) != float(default_value)
+
+        primary_new_set = _is_non_default_list(
+            self.primary_action_group_indices, DEFAULT_PRIMARY_ACTION_GROUP_INDICES
         )
-        self.lower_body_joint_indices = _normalize_joint_indices(
-            self.lower_body_joint_indices, "lower_body_joint_indices"
+        primary_legacy_set = _is_non_default_list(
+            self.upper_body_joint_indices, DEFAULT_PRIMARY_ACTION_GROUP_INDICES
         )
-        overlap = set(self.upper_body_joint_indices).intersection(self.lower_body_joint_indices)
+        secondary_new_set = _is_non_default_list(
+            self.secondary_action_group_indices, DEFAULT_SECONDARY_ACTION_GROUP_INDICES
+        )
+        secondary_legacy_set = _is_non_default_list(
+            self.lower_body_joint_indices, DEFAULT_SECONDARY_ACTION_GROUP_INDICES
+        )
+
+        primary_weight_new_set = _is_non_default_float(
+            self.primary_action_group_loss_weight, DEFAULT_PRIMARY_ACTION_GROUP_LOSS_WEIGHT
+        )
+        primary_weight_legacy_set = _is_non_default_float(
+            self.upper_body_loss_weight, DEFAULT_PRIMARY_ACTION_GROUP_LOSS_WEIGHT
+        )
+        secondary_weight_new_set = _is_non_default_float(
+            self.secondary_action_group_loss_weight, DEFAULT_SECONDARY_ACTION_GROUP_LOSS_WEIGHT
+        )
+        secondary_weight_legacy_set = _is_non_default_float(
+            self.lower_body_loss_weight, DEFAULT_SECONDARY_ACTION_GROUP_LOSS_WEIGHT
+        )
+
+        if (
+            primary_new_set
+            and primary_legacy_set
+            and list(self.primary_action_group_indices) != list(self.upper_body_joint_indices)
+        ):
+            print(
+                "[GrootCoTConfig] Both primary_action_group_indices and upper_body_joint_indices are set "
+                "with different values. Using primary_action_group_indices."
+            )
+        if (
+            secondary_new_set
+            and secondary_legacy_set
+            and list(self.secondary_action_group_indices) != list(self.lower_body_joint_indices)
+        ):
+            print(
+                "[GrootCoTConfig] Both secondary_action_group_indices and lower_body_joint_indices are set "
+                "with different values. Using secondary_action_group_indices."
+            )
+        if (
+            primary_weight_new_set
+            and primary_weight_legacy_set
+            and float(self.primary_action_group_loss_weight) != float(self.upper_body_loss_weight)
+        ):
+            print(
+                "[GrootCoTConfig] Both primary_action_group_loss_weight and upper_body_loss_weight are set "
+                "with different values. Using primary_action_group_loss_weight."
+            )
+        if (
+            secondary_weight_new_set
+            and secondary_weight_legacy_set
+            and float(self.secondary_action_group_loss_weight) != float(self.lower_body_loss_weight)
+        ):
+            print(
+                "[GrootCoTConfig] Both secondary_action_group_loss_weight and lower_body_loss_weight are set "
+                "with different values. Using secondary_action_group_loss_weight."
+            )
+
+        primary_indices_raw = list(self.primary_action_group_indices)
+        if not primary_new_set and primary_legacy_set:
+            primary_indices_raw = list(self.upper_body_joint_indices)
+
+        secondary_indices_raw = list(self.secondary_action_group_indices)
+        if not secondary_new_set and secondary_legacy_set:
+            secondary_indices_raw = list(self.lower_body_joint_indices)
+
+        primary_weight = float(self.primary_action_group_loss_weight)
+        if not primary_weight_new_set and primary_weight_legacy_set:
+            primary_weight = float(self.upper_body_loss_weight)
+
+        secondary_weight = float(self.secondary_action_group_loss_weight)
+        if not secondary_weight_new_set and secondary_weight_legacy_set:
+            secondary_weight = float(self.lower_body_loss_weight)
+
+        if primary_weight < 0.0:
+            raise ValueError("primary_action_group_loss_weight must be >= 0.")
+        if secondary_weight < 0.0:
+            raise ValueError("secondary_action_group_loss_weight must be >= 0.")
+        if primary_weight == 0.0 and secondary_weight == 0.0:
+            raise ValueError(
+                "At least one of primary_action_group_loss_weight or "
+                "secondary_action_group_loss_weight must be > 0."
+            )
+
+        primary_indices = _normalize_joint_indices(
+            primary_indices_raw, "primary_action_group_indices"
+        )
+        secondary_indices = _normalize_joint_indices(
+            secondary_indices_raw, "secondary_action_group_indices"
+        )
+        overlap = set(primary_indices).intersection(secondary_indices)
         if overlap:
             raise ValueError(
-                "upper_body_joint_indices and lower_body_joint_indices overlap: "
+                "primary_action_group_indices and secondary_action_group_indices overlap: "
                 f"{sorted(overlap)}"
             )
 
+        # Canonicalize to clear names and mirror to legacy aliases for compatibility.
+        self.primary_action_group_indices = primary_indices
+        self.secondary_action_group_indices = secondary_indices
+        self.primary_action_group_loss_weight = primary_weight
+        self.secondary_action_group_loss_weight = secondary_weight
+        self.upper_body_joint_indices = list(primary_indices)
+        self.lower_body_joint_indices = list(secondary_indices)
+        self.upper_body_loss_weight = float(primary_weight)
+        self.lower_body_loss_weight = float(secondary_weight)
+
         # groot_repo_path is now optional since we ported the components
         # No validation needed
+
+    def _resolve_system2_vlm(self) -> None:
+        # Validate early to provide clear config-time errors.
+        self.system2_vlm_preset = validate_system2_vlm_preset(self.system2_vlm_preset)
+        model_id, source, normalized_preset = resolve_system2_vlm_model_id(
+            preset=self.system2_vlm_preset,
+            explicit_model_id=self.system2_vlm_model_id,
+            legacy_model_id=self.vlm_processor_model_id,
+        )
+        self.system2_vlm_preset = normalized_preset
+        self.resolved_system2_vlm_model_id = model_id
+        self.resolved_system2_vlm_source = source
+        # Mirror for backward compatibility with existing code paths.
+        self.vlm_processor_model_id = model_id
 
     def _apply_training_stage_preset(self) -> None:
         stage = (self.training_stage or "manual").strip().lower()

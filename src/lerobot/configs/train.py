@@ -53,6 +53,13 @@ class TrainPipelineConfig(HubMixin):
     # Number of workers for the dataloader.
     num_workers: int = 4
     batch_size: int = 8
+    # Optional epoch-based training target for offline datasets.
+    # When set, train.py resolves total optimizer steps as:
+    #   steps = ceil(dataset.num_frames / effective_batch_size) * epochs
+    # and this resolved value is used for scheduler/checkpointing.
+    # `steps` remains available for backward compatibility and is used
+    # when `epochs` is not provided.
+    epochs: int | None = None
     steps: int = 100_000
     eval_freq: int = 20_000
     log_freq: int = 200
@@ -163,6 +170,10 @@ class TrainPipelineConfig(HubMixin):
 
         if self.keep_last_n_checkpoints is not None and self.keep_last_n_checkpoints < 1:
             raise ValueError("keep_last_n_checkpoints must be >= 1 when provided.")
+        if self.steps < 1:
+            raise ValueError("steps must be >= 1.")
+        if self.epochs is not None and self.epochs < 1:
+            raise ValueError("epochs must be >= 1 when provided.")
         if self.joint_reconstruction_num_episodes < 0:
             raise ValueError("joint_reconstruction_num_episodes must be >= 0.")
         if self.joint_reconstruction_start_episode < 0:

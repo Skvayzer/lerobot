@@ -158,7 +158,12 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
     num_target_vision_tokens: int = field(default=32, metadata={"help": "Number of target vision tokens."})
     # Optional extra observation vectors (e.g., IMU, odometry, tactile) projected into state token.
     extra_observation_dims: dict[str, int] = field(default_factory=dict)
-    # Optional joint split for weighted action reconstruction loss.
+    # Optional action-group split for weighted action reconstruction loss.
+    primary_action_group_indices: list[int] = field(default_factory=list)
+    secondary_action_group_indices: list[int] = field(default_factory=list)
+    primary_action_group_loss_weight: float = field(default=1.0)
+    secondary_action_group_loss_weight: float = field(default=0.0)
+    # Legacy aliases retained for backward compatibility with old checkpoints.
     upper_body_joint_indices: list[int] = field(default_factory=list)
     lower_body_joint_indices: list[int] = field(default_factory=list)
     upper_body_loss_weight: float = field(default=1.0)
@@ -376,65 +381,88 @@ class FlowmatchingActionHead(nn.Module):
 
     def _configure_joint_loss_split(self) -> None:
         action_dim = int(self.action_dim)
-        upper_weight = float(getattr(self.config, "upper_body_loss_weight", 1.0))
-        lower_weight = float(getattr(self.config, "lower_body_loss_weight", 0.0))
-        upper_indices = self._normalize_joint_indices(
-            getattr(self.config, "upper_body_joint_indices", []), action_dim, "upper_body_joint_indices"
+        primary_weight = float(getattr(self.config, "primary_action_group_loss_weight", 1.0))
+        secondary_weight = float(getattr(self.config, "secondary_action_group_loss_weight", 0.0))
+        legacy_primary_weight = float(getattr(self.config, "upper_body_loss_weight", primary_weight))
+        legacy_secondary_weight = float(getattr(self.config, "lower_body_loss_weight", secondary_weight))
+        if primary_weight == 1.0 and legacy_primary_weight != 1.0:
+            primary_weight = legacy_primary_weight
+        if secondary_weight == 0.0 and legacy_secondary_weight != 0.0:
+            secondary_weight = legacy_secondary_weight
+        primary_indices_raw = list(getattr(self.config, "primary_action_group_indices", []) or [])
+        secondary_indices_raw = list(getattr(self.config, "secondary_action_group_indices", []) or [])
+        legacy_primary_indices = list(getattr(self.config, "upper_body_joint_indices", []) or [])
+        legacy_secondary_indices = list(getattr(self.config, "lower_body_joint_indices", []) or [])
+        if not primary_indices_raw and legacy_primary_indices:
+            primary_indices_raw = legacy_primary_indices
+        if not secondary_indices_raw and legacy_secondary_indices:
+            secondary_indices_raw = legacy_secondary_indices
+
+        primary_indices = self._normalize_joint_indices(
+            primary_indices_raw, action_dim, "primary_action_group_indices"
         )
-        lower_indices = self._normalize_joint_indices(
-            getattr(self.config, "lower_body_joint_indices", []), action_dim, "lower_body_joint_indices"
+        secondary_indices = self._normalize_joint_indices(
+            secondary_indices_raw, action_dim, "secondary_action_group_indices"
         )
 
-        overlap = sorted(set(upper_indices).intersection(lower_indices))
+        overlap = sorted(set(primary_indices).intersection(secondary_indices))
         if overlap:
             raise ValueError(
-                "upper_body_joint_indices and lower_body_joint_indices overlap in FlowmatchingActionHead: "
+                "primary_action_group_indices and secondary_action_group_indices overlap in FlowmatchingActionHead: "
                 f"{overlap}"
             )
 
-        both_sets_provided = bool(upper_indices) and bool(lower_indices)
-        upper_selector = torch.zeros(action_dim, dtype=torch.float32)
-        lower_selector = torch.zeros(action_dim, dtype=torch.float32)
+        both_sets_provided = bool(primary_indices) and bool(secondary_indices)
+        primary_selector = torch.zeros(action_dim, dtype=torch.float32)
+        secondary_selector = torch.zeros(action_dim, dtype=torch.float32)
 
         if both_sets_provided:
-            upper_selector[upper_indices] = 1.0
-            lower_selector[lower_indices] = 1.0
-        elif upper_indices:
-            upper_selector[upper_indices] = 1.0
-            lower_selector = 1.0 - upper_selector
-        elif lower_indices:
-            lower_selector[lower_indices] = 1.0
-            upper_selector = 1.0 - lower_selector
+            primary_selector[primary_indices] = 1.0
+            secondary_selector[secondary_indices] = 1.0
+        elif primary_indices:
+            primary_selector[primary_indices] = 1.0
+            secondary_selector = 1.0 - primary_selector
+        elif secondary_indices:
+            secondary_selector[secondary_indices] = 1.0
+            primary_selector = 1.0 - secondary_selector
         else:
-            upper_selector[:] = 1.0
-            lower_selector[:] = 0.0
+            primary_selector[:] = 1.0
+            secondary_selector[:] = 0.0
 
-        if upper_weight < 0.0 or lower_weight < 0.0:
+        if primary_weight < 0.0 or secondary_weight < 0.0:
             raise ValueError(
-                "upper_body_loss_weight and lower_body_loss_weight must be non-negative. "
-                f"Got ({upper_weight}, {lower_weight})."
+                "primary_action_group_loss_weight and secondary_action_group_loss_weight must be non-negative. "
+                f"Got ({primary_weight}, {secondary_weight})."
             )
-        if upper_weight == 0.0 and lower_weight == 0.0:
-            raise ValueError("At least one of upper_body_loss_weight or lower_body_loss_weight must be > 0.")
+        if primary_weight == 0.0 and secondary_weight == 0.0:
+            raise ValueError(
+                "At least one of primary_action_group_loss_weight or "
+                "secondary_action_group_loss_weight must be > 0."
+            )
 
-        self.upper_body_loss_weight = upper_weight
-        self.lower_body_loss_weight = lower_weight
-        self.upper_body_joint_indices = upper_indices
-        self.lower_body_joint_indices = lower_indices
-        self.register_buffer("_upper_joint_selector", upper_selector.view(1, 1, -1), persistent=False)
-        self.register_buffer("_lower_joint_selector", lower_selector.view(1, 1, -1), persistent=False)
+        self.primary_action_group_loss_weight = primary_weight
+        self.secondary_action_group_loss_weight = secondary_weight
+        self.primary_action_group_indices = primary_indices
+        self.secondary_action_group_indices = secondary_indices
+        # Legacy aliases for existing logs/consumers.
+        self.upper_body_loss_weight = primary_weight
+        self.lower_body_loss_weight = secondary_weight
+        self.upper_body_joint_indices = primary_indices
+        self.lower_body_joint_indices = secondary_indices
+        self.register_buffer("_primary_joint_selector", primary_selector.view(1, 1, -1), persistent=False)
+        self.register_buffer("_secondary_joint_selector", secondary_selector.view(1, 1, -1), persistent=False)
 
         print(
             "[FlowmatchingActionHead] Joint loss split: "
-            f"upper_dims={int(upper_selector.sum().item())}, "
-            f"lower_dims={int(lower_selector.sum().item())}, "
-            f"upper_weight={self.upper_body_loss_weight}, "
-            f"lower_weight={self.lower_body_loss_weight}"
+            f"primary_dims={int(primary_selector.sum().item())}, "
+            f"secondary_dims={int(secondary_selector.sum().item())}, "
+            f"primary_weight={self.primary_action_group_loss_weight}, "
+            f"secondary_weight={self.secondary_action_group_loss_weight}"
         )
-        if upper_indices or lower_indices:
+        if primary_indices or secondary_indices:
             print(
                 "[FlowmatchingActionHead] Joint index sets: "
-                f"upper={upper_indices}, lower={lower_indices}"
+                f"primary={primary_indices}, secondary={secondary_indices}"
             )
 
     def sample_time(self, batch_size, device, dtype):
@@ -573,46 +601,46 @@ class FlowmatchingActionHead(nn.Module):
         pred = self.action_decoder(model_output, embodiment_id)
         pred_actions = pred[:, -actions.shape[1] :]
 
-        # Weighted split loss: upper-body and lower-body joints.
+        # Weighted split loss across primary and secondary action groups.
         action_mask = action_input.action_mask.to(dtype=pred_actions.dtype)
         mse = F.mse_loss(pred_actions, velocity, reduction="none")
 
-        upper_selector = self._upper_joint_selector.to(device=pred_actions.device, dtype=pred_actions.dtype)
-        lower_selector = self._lower_joint_selector.to(device=pred_actions.device, dtype=pred_actions.dtype)
-        upper_mask = action_mask * upper_selector
-        lower_mask = action_mask * lower_selector
+        primary_selector = self._primary_joint_selector.to(device=pred_actions.device, dtype=pred_actions.dtype)
+        secondary_selector = self._secondary_joint_selector.to(device=pred_actions.device, dtype=pred_actions.dtype)
+        primary_mask = action_mask * primary_selector
+        secondary_mask = action_mask * secondary_selector
 
-        upper_denom = upper_mask.sum()
-        lower_denom = lower_mask.sum()
+        primary_denom = primary_mask.sum()
+        secondary_denom = secondary_mask.sum()
 
         zero = mse.new_zeros(())
-        upper_loss = (mse * upper_mask).sum() / upper_denom if upper_denom.item() > 0 else zero
-        lower_loss = (mse * lower_mask).sum() / lower_denom if lower_denom.item() > 0 else zero
+        primary_loss = (mse * primary_mask).sum() / primary_denom if primary_denom.item() > 0 else zero
+        secondary_loss = (mse * secondary_mask).sum() / secondary_denom if secondary_denom.item() > 0 else zero
         loss = (
-            self.upper_body_loss_weight * upper_loss
-            + self.lower_body_loss_weight * lower_loss
+            self.primary_action_group_loss_weight * primary_loss
+            + self.secondary_action_group_loss_weight * secondary_loss
         )
 
-        if upper_denom.item() == 0 and self.upper_body_loss_weight > 0:
+        if primary_denom.item() == 0 and self.primary_action_group_loss_weight > 0:
             print(
-                "[GROOT][DEBUG] upper-body loss mask is empty; "
-                f"upper_selector_sum={upper_selector.sum().detach().float().cpu().item()}, "
+                "[GROOT][DEBUG] primary action-group loss mask is empty; "
+                f"primary_selector_sum={primary_selector.sum().detach().float().cpu().item()}, "
                 f"action_mask_sum={action_mask.sum().detach().float().cpu().item()}"
             )
-        if lower_denom.item() == 0 and self.lower_body_loss_weight > 0:
+        if secondary_denom.item() == 0 and self.secondary_action_group_loss_weight > 0:
             print(
-                "[GROOT][DEBUG] lower-body loss mask is empty; "
-                f"lower_selector_sum={lower_selector.sum().detach().float().cpu().item()}, "
+                "[GROOT][DEBUG] secondary action-group loss mask is empty; "
+                f"secondary_selector_sum={secondary_selector.sum().detach().float().cpu().item()}, "
                 f"action_mask_sum={action_mask.sum().detach().float().cpu().item()}"
             )
         if torch.isnan(loss):
             with torch.no_grad():
                 print(
                     "[GROOT][DEBUG] NaN loss detected.",
-                    f"upper_loss={upper_loss.detach().float().cpu().item()}",
-                    f"lower_loss={lower_loss.detach().float().cpu().item()}",
-                    f"upper_denom={upper_denom.detach().float().cpu().item()}",
-                    f"lower_denom={lower_denom.detach().float().cpu().item()}",
+                    f"primary_loss={primary_loss.detach().float().cpu().item()}",
+                    f"secondary_loss={secondary_loss.detach().float().cpu().item()}",
+                    f"primary_denom={primary_denom.detach().float().cpu().item()}",
+                    f"secondary_denom={secondary_denom.detach().float().cpu().item()}",
                     f"pred_actions_stats=(min={pred_actions.min().detach().float().cpu().item()}, "
                     f"max={pred_actions.max().detach().float().cpu().item()}, "
                     f"mean={pred_actions.mean().detach().float().cpu().item()})",
@@ -622,10 +650,15 @@ class FlowmatchingActionHead(nn.Module):
                 )
         output_dict = {
             "loss": loss,
-            "loss_upper": upper_loss.detach(),
-            "loss_lower": lower_loss.detach(),
-            "loss_upper_weighted": (self.upper_body_loss_weight * upper_loss).detach(),
-            "loss_lower_weighted": (self.lower_body_loss_weight * lower_loss).detach(),
+            "loss_primary": primary_loss.detach(),
+            "loss_secondary": secondary_loss.detach(),
+            "loss_primary_weighted": (self.primary_action_group_loss_weight * primary_loss).detach(),
+            "loss_secondary_weighted": (self.secondary_action_group_loss_weight * secondary_loss).detach(),
+            # Legacy keys kept for backward-compatible logging.
+            "loss_upper": primary_loss.detach(),
+            "loss_lower": secondary_loss.detach(),
+            "loss_upper_weighted": (self.primary_action_group_loss_weight * primary_loss).detach(),
+            "loss_lower_weighted": (self.secondary_action_group_loss_weight * secondary_loss).detach(),
         }
         return BatchFeature(data=output_dict)
 

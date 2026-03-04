@@ -34,14 +34,20 @@ from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets.factory import make_dataset
 from lerobot.datasets.sampler import EpisodeAwareSampler
 from lerobot.datasets.utils import cycle
-from lerobot.envs.factory import make_env, make_env_pre_post_processors
+from lerobot.envs.factory import make_env
 from lerobot.envs.utils import close_envs
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.rl.wandb_utils import WandBLogger
 from lerobot.scripts.lerobot_eval import eval_policy_all
-from lerobot.utils.import_utils import register_third_party_plugins
+from lerobot.training.recap_utils import build_index_to_value, gather_values_by_index, load_labels_table
+try:
+    from lerobot.utils.import_utils import register_third_party_plugins
+except ImportError:
+    def register_third_party_plugins(*args, **kwargs):
+        # Backward-compatibility for older utils.import_utils API.
+        return None
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 from lerobot.utils.random_utils import set_seed
 from lerobot.utils.train_utils import (
@@ -57,6 +63,13 @@ from lerobot.utils.utils import (
     has_method,
     init_logging,
 )
+
+try:
+    from lerobot.envs.factory import make_env_pre_post_processors
+except ImportError:
+    def make_env_pre_post_processors(*args, **kwargs):
+        # Backward-compatibility for env factory versions that do not expose this helper.
+        return (lambda x: x), (lambda x: x)
 
 
 def update_policy(
@@ -151,6 +164,39 @@ def update_policy(
     train_metrics.lr = optimizer.param_groups[0]["lr"]
     train_metrics.update_s = time.perf_counter() - start_time
     return train_metrics, output_dict
+
+
+def _resolve_total_training_steps(
+    cfg: TrainPipelineConfig,
+    *,
+    dataset_num_frames: int,
+    num_processes: int,
+    is_main_process: bool,
+) -> tuple[int, int]:
+    """Resolve total optimizer steps and effective batch size.
+
+    If `cfg.epochs` is provided, convert epochs to optimizer steps using:
+      ceil(dataset_num_frames / effective_batch_size) * epochs
+    where effective_batch_size = cfg.batch_size * num_processes.
+    """
+    effective_batch_size = max(1, int(cfg.batch_size) * int(num_processes))
+    epochs = getattr(cfg, "epochs", None)
+    if epochs is None:
+        return int(cfg.steps), effective_batch_size
+
+    steps_per_epoch = max(1, math.ceil(int(dataset_num_frames) / effective_batch_size))
+    resolved_steps = int(epochs) * steps_per_epoch
+    if is_main_process:
+        logging.info(
+            "Epoch-based training enabled: epochs=%d, steps_per_epoch=%d "
+            "(dataset_num_frames=%d, effective_batch_size=%d) -> resolved steps=%d",
+            int(epochs),
+            steps_per_epoch,
+            int(dataset_num_frames),
+            effective_batch_size,
+            resolved_steps,
+        )
+    return resolved_steps, effective_batch_size
 
 
 def _to_numpy_action(action: torch.Tensor) -> np.ndarray:
@@ -264,6 +310,39 @@ def _row_get(row: Any, key: str, default: Any = None) -> Any:
         return row[key]
     except Exception:
         return default
+
+
+def _inject_recap_indicator_from_labels(
+    batch: dict[str, Any],
+    *,
+    index_to_indicator: dict[int, float] | None,
+    indicator_key: str,
+    null_value: float,
+) -> None:
+    if not index_to_indicator:
+        return
+    if "index" not in batch:
+        return
+
+    index_tensor = batch["index"]
+    if not isinstance(index_tensor, torch.Tensor):
+        return
+
+    device = index_tensor.device
+    dtype = torch.float32
+    for value in batch.values():
+        if isinstance(value, torch.Tensor):
+            dtype = value.dtype if value.dtype.is_floating_point else torch.float32
+            device = value.device
+            break
+
+    batch[indicator_key] = gather_values_by_index(
+        index_tensor,
+        index_to_value=index_to_indicator,
+        default_value=float(null_value),
+        dtype=dtype,
+        device=device,
+    )
 
 
 def _run_joint_reconstruction_eval(
@@ -612,6 +691,14 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     if not is_main_process:
         dataset = make_dataset(cfg)
 
+    resolved_steps, effective_batch_size = _resolve_total_training_steps(
+        cfg,
+        dataset_num_frames=int(dataset.num_frames),
+        num_processes=int(accelerator.num_processes),
+        is_main_process=is_main_process,
+    )
+    cfg.steps = resolved_steps
+
     # Create environment used for evaluating checkpoints during training on simulation data.
     # On real-world data, no need to create an environment as evaluations are done outside train.py,
     # using the eval.py instead, with gym_dora environment and dora-rs.
@@ -675,6 +762,39 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         **postprocessor_kwargs,
     )
 
+    recap_indicator_lookup: dict[int, float] | None = None
+    recap_indicator_key = str(getattr(cfg.policy, "recap_adv_indicator_key", "observation.extra.adv_indicator"))
+    recap_indicator_null = float(getattr(cfg.policy, "recap_adv_indicator_null_value", -1.0))
+    if bool(getattr(cfg.policy, "recap_enable", False)):
+        labels_path = getattr(cfg.policy, "recap_labels_path", None)
+        if labels_path:
+            labels_df = load_labels_table(labels_path)
+            recap_indicator_lookup = build_index_to_value(labels_df, "indicator")
+            if is_main_process:
+                logging.info(
+                    "Loaded RECAP labels: rows=%d, index_to_indicator=%d, path=%s",
+                    len(labels_df),
+                    len(recap_indicator_lookup),
+                    labels_path,
+                )
+                if "advantage" in labels_df.columns:
+                    advantage_series = labels_df["advantage"].astype(float)
+                    logging.info(
+                        "RECAP advantage stats: mean=%.6f std=%.6f min=%.6f max=%.6f",
+                        float(advantage_series.mean()),
+                        float(advantage_series.std()),
+                        float(advantage_series.min()),
+                        float(advantage_series.max()),
+                    )
+                if "task_name" in labels_df.columns:
+                    pos_rates = labels_df.groupby("task_name")["indicator"].mean().to_dict()
+                    logging.info("RECAP per-task indicator positive rate: %s", pos_rates)
+        elif is_main_process:
+            logging.info(
+                "RECAP enabled but recap_labels_path is not set. "
+                "Training will fall back to null/unconditional indicator."
+            )
+
     if is_main_process:
         logging.info("Creating optimizer and scheduler")
     optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
@@ -706,6 +826,13 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
     if cfg.resume:
         step, optimizer, lr_scheduler = load_training_state(cfg.checkpoint_path, optimizer, lr_scheduler)
+        if step >= cfg.steps and is_main_process:
+            logging.warning(
+                "Resumed step (%d) is already >= target steps (%d). "
+                "Training loop will run zero updates.",
+                step,
+                cfg.steps,
+            )
 
     num_learnable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     num_total_params = sum(p.numel() for p in policy.parameters())
@@ -722,8 +849,12 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         logging.info(f"{dataset.num_frames=} ({format_big_number(dataset.num_frames)})")
         logging.info(f"{dataset.num_episodes=}")
         num_processes = accelerator.num_processes
-        effective_bs = cfg.batch_size * num_processes
-        logging.info(f"Effective batch size: {cfg.batch_size} x {num_processes} = {effective_bs}")
+        logging.info(
+            "Effective batch size: %d x %d = %d",
+            cfg.batch_size,
+            num_processes,
+            effective_batch_size,
+        )
         logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
@@ -770,7 +901,6 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     }
 
     # Use effective batch size for proper epoch calculation in distributed training
-    effective_batch_size = cfg.batch_size * accelerator.num_processes
     train_tracker = MetricsTracker(
         effective_batch_size,
         dataset.num_frames,
@@ -791,6 +921,12 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         start_time = time.perf_counter()
         batch = next(dl_iter)
         batch = preprocessor(batch)
+        _inject_recap_indicator_from_labels(
+            batch,
+            index_to_indicator=recap_indicator_lookup,
+            indicator_key=recap_indicator_key,
+            null_value=recap_indicator_null,
+        )
         train_tracker.dataloading_s = time.perf_counter() - start_time
 
         train_tracker, output_dict = update_policy(
@@ -803,6 +939,14 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             lr_scheduler=lr_scheduler,
             rabc_weights_provider=rabc_weights,
         )
+        if recap_indicator_key in batch and isinstance(batch[recap_indicator_key], torch.Tensor):
+            indicator = batch[recap_indicator_key].detach()
+            output_dict["recap/indicator_pos_frac"] = (
+                (indicator > 0.5).float().mean().cpu().item()
+            )
+            output_dict["recap/indicator_null_frac"] = (
+                (indicator == recap_indicator_null).float().mean().cpu().item()
+            )
 
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
         # increment `step` here.

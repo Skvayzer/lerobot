@@ -60,6 +60,7 @@ from lerobot.policies.grootCoT.action_head.flow_matching_action_head import (
     FlowmatchingActionHead,
     FlowmatchingActionHeadConfig,
 )
+from lerobot.policies.grootCoT.system2_vlm_registry import DEFAULT_SYSTEM2_VLM_MODEL_ID
 from lerobot.policies.groot.utils import ensure_eagle_cache_ready
 from lerobot.utils.constants import HF_LEROBOT_HOME
 
@@ -77,7 +78,7 @@ torch.linspace = _safe_linspace
 
 DEFAULT_VENDOR_EAGLE_PATH = str((Path(__file__).resolve().parent / "eagle2_hg_model").resolve())
 DEFAULT_TOKENIZER_ASSETS_REPO = "lerobot/eagle2hg-processor-groot-n1p5"
-DEFAULT_QWEN_MODEL_ID = "Qwen/Qwen3-VL-8B-Thinking"
+DEFAULT_QWEN_MODEL_ID = DEFAULT_SYSTEM2_VLM_MODEL_ID
 DEFAULT_SUMMARY_TOKEN = "<SUMMARY>"
 DEFAULT_QWEN_INPUT_PREFIX = "qwen_"
 LEGACY_EAGLE_INPUT_PREFIX = "eagle_"
@@ -89,6 +90,12 @@ class QwenBackbone(nn.Module):
         model_id: str = DEFAULT_QWEN_MODEL_ID,
         tune_vlm: bool = False,
         tune_projector: bool = True,
+        value_head_enable: bool = False,
+        tune_value_head: bool = True,
+        value_head_bins: int = 201,
+        value_head_vmin: float = -1.0,
+        value_head_vmax: float = 0.0,
+        value_head_pooling: str = "masked_mean",
         tune_top_llm_layers: int = 0,
         select_layer: int | None = None,
         project_to_dim: int | None = 1536,
@@ -111,6 +118,12 @@ class QwenBackbone(nn.Module):
         self.summary_avg_last_k = summary_avg_last_k
         self.lora_config = lora_config or {}
         self.tune_top_llm_layers = max(0, int(tune_top_llm_layers))
+        self.value_head_enable = bool(value_head_enable)
+        self.tune_value_head = bool(tune_value_head)
+        self.value_head_pooling = str(value_head_pooling)
+        self.value_head_bins = int(value_head_bins)
+        self.value_head_vmin = float(value_head_vmin)
+        self.value_head_vmax = float(value_head_vmax)
         self._tokenizer = None
 
         dtype = torch.bfloat16 if load_bf16 else None
@@ -174,14 +187,38 @@ class QwenBackbone(nn.Module):
 
         if project_to_dim is None:
             self.projector = nn.Identity()
+            value_input_dim = int(hidden_size)
         else:
             self.projector = nn.Sequential(nn.LayerNorm(hidden_size), nn.Linear(hidden_size, project_to_dim))
+            value_input_dim = int(project_to_dim)
             if load_bf16:
                 self.projector = self.projector.to(torch.bfloat16)
+
+        if self.value_head_enable:
+            if self.value_head_bins < 2:
+                raise ValueError("value_head_bins must be >= 2.")
+            if self.value_head_vmax <= self.value_head_vmin:
+                raise ValueError("value_head_vmax must be > value_head_vmin.")
+            if self.value_head_pooling not in {"masked_mean", "last_token"}:
+                raise ValueError("value_head_pooling must be one of {'masked_mean', 'last_token'}.")
+            self.value_head = nn.Sequential(
+                nn.LayerNorm(value_input_dim),
+                nn.Linear(value_input_dim, value_input_dim),
+                nn.GELU(),
+                nn.Linear(value_input_dim, self.value_head_bins),
+            )
+            self.register_buffer(
+                "value_bin_centers",
+                torch.linspace(self.value_head_vmin, self.value_head_vmax, self.value_head_bins),
+                persistent=False,
+            )
+        else:
+            self.value_head = None
 
         self.set_trainable_parameters(
             tune_vlm=tune_vlm,
             tune_projector=tune_projector,
+            tune_value_head=self.tune_value_head,
             tune_top_llm_layers=self.tune_top_llm_layers,
         )
 
@@ -232,10 +269,12 @@ class QwenBackbone(nn.Module):
         self,
         tune_vlm: bool,
         tune_projector: bool,
+        tune_value_head: bool = True,
         tune_top_llm_layers: int | None = None,
     ):
         self.tune_vlm = tune_vlm
         self.tune_projector = tune_projector
+        self.tune_value_head = bool(tune_value_head)
         if tune_top_llm_layers is None:
             tune_top_llm_layers = self.tune_top_llm_layers
         self.tune_top_llm_layers = max(0, int(tune_top_llm_layers))
@@ -273,9 +312,12 @@ class QwenBackbone(nn.Module):
                 self.qwen_model.requires_grad_(True)
         if tune_projector:
             self.projector.requires_grad_(True)
+        if self.value_head_enable and self.value_head is not None and self.tune_value_head:
+            self.value_head.requires_grad_(True)
 
         print(f"Tune Qwen VLM: {self.tune_vlm}")
         print(f"Tune Qwen projector: {self.tune_projector}")
+        print(f"Tune Qwen value head: {self.value_head_enable and self.tune_value_head}")
         print(f"Tune Qwen top LLM layers: {self.tune_top_llm_layers}")
         
         if not any(p.requires_grad for p in self.parameters()):
@@ -429,6 +471,40 @@ class QwenBackbone(nn.Module):
         qwen_features = self.projector(qwen_features)
         return qwen_features, qwen_mask
 
+    def _pool_for_value(
+        self,
+        qwen_features: torch.Tensor,
+        qwen_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if self.value_head_pooling == "last_token":
+            if qwen_mask is None:
+                return qwen_features[:, -1, :]
+            lengths = qwen_mask.long().sum(dim=1).clamp(min=1)
+            idx = (lengths - 1).clamp(max=qwen_features.shape[1] - 1)
+            batch_idx = torch.arange(qwen_features.shape[0], device=qwen_features.device)
+            return qwen_features[batch_idx, idx]
+
+        if qwen_mask is None:
+            return qwen_features.mean(dim=1)
+
+        mask = qwen_mask.to(device=qwen_features.device, dtype=qwen_features.dtype).unsqueeze(-1)
+        denom = mask.sum(dim=1).clamp(min=1.0)
+        return (qwen_features * mask).sum(dim=1) / denom
+
+    def _compute_value_outputs(
+        self,
+        qwen_features: torch.Tensor,
+        qwen_mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.value_head is None:
+            raise RuntimeError("Value head is not enabled for this backbone.")
+        pooled = self._pool_for_value(qwen_features, qwen_mask)
+        logits = self.value_head(pooled)
+        probs = torch.softmax(logits, dim=-1)
+        bin_centers = self.value_bin_centers.to(device=logits.device, dtype=logits.dtype)
+        value_scalar = (probs * bin_centers.unsqueeze(0)).sum(dim=-1)
+        return logits, value_scalar
+
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
         self.set_frozen_modules_to_eval_mode()
         qwen_embeds, qwen_mask = self.forward_qwen(vl_input)
@@ -442,7 +518,15 @@ class QwenBackbone(nn.Module):
                     f"shape={tuple(qwen_embeds.shape)}"
                 )
                 qwen_embeds = torch.nan_to_num(qwen_embeds, nan=0.0, posinf=0.0, neginf=0.0)
-        return BatchFeature(data={"backbone_features": qwen_embeds, "backbone_attention_mask": qwen_mask})
+        output: dict[str, torch.Tensor | None] = {
+            "backbone_features": qwen_embeds,
+            "backbone_attention_mask": qwen_mask,
+        }
+        if self.value_head_enable and self.value_head is not None:
+            value_logits, value_scalar = self._compute_value_outputs(qwen_embeds, qwen_mask)
+            output["value_logits"] = value_logits
+            output["value_scalar"] = value_scalar
+        return BatchFeature(data=output)
 
     @torch.no_grad()
     def extract_reasoning_trace(
@@ -856,6 +940,23 @@ class GR00TN15(PreTrainedModel):
         self.validate_data(action_head_outputs, backbone_outputs, is_training=False)
         return action_head_outputs
 
+    def predict_value(
+        self,
+        inputs: dict,
+    ) -> BatchFeature:
+        backbone_outputs = self.run_backbone(inputs)
+        if "value_logits" not in backbone_outputs or "value_scalar" not in backbone_outputs:
+            raise ValueError(
+                "Value head outputs are unavailable. Enable Qwen value head via "
+                "`value_head_enable=true` / `policy.recap_value_head_enable=true`."
+            )
+        return BatchFeature(
+            data={
+                "value_logits": backbone_outputs["value_logits"],
+                "value_scalar": backbone_outputs["value_scalar"],
+            }
+        )
+
     @torch.no_grad()
     def extract_cot_trace(
         self,
@@ -935,6 +1036,7 @@ class GR00TN15(PreTrainedModel):
         groups = {
             "backbone_vlm": 0,
             "backbone_projector": 0,
+            "backbone_value_head": 0,
             "action_head_diffusion": 0,
             "action_head_projector": 0,
             "action_head_vlln": 0,
@@ -947,6 +1049,8 @@ class GR00TN15(PreTrainedModel):
             numel = param.numel()
             if name.startswith("backbone.projector."):
                 groups["backbone_projector"] += numel
+            elif name.startswith("backbone.value_head."):
+                groups["backbone_value_head"] += numel
             elif name.startswith("backbone.qwen_model."):
                 groups["backbone_vlm"] += numel
             elif name.startswith("action_head.model."):
@@ -976,6 +1080,7 @@ class GR00TN15(PreTrainedModel):
         )
         print(f"[GROOT]  backbone_vlm={groups['backbone_vlm']:,}")
         print(f"[GROOT]  backbone_projector={groups['backbone_projector']:,}")
+        print(f"[GROOT]  backbone_value_head={groups['backbone_value_head']:,}")
         print(f"[GROOT]  action_head_diffusion={groups['action_head_diffusion']:,}")
         print(f"[GROOT]  action_head_projector={groups['action_head_projector']:,}")
         print(f"[GROOT]  action_head_vlln={groups['action_head_vlln']:,}")
@@ -992,11 +1097,29 @@ class GR00TN15(PreTrainedModel):
         tune_projector = kwargs.pop("tune_projector", True)
         tune_diffusion_model = kwargs.pop("tune_diffusion_model", True)
         tune_vlln = kwargs.pop("tune_vlln", True)
+        value_head_enable = kwargs.pop("value_head_enable", False)
+        tune_value_head = kwargs.pop("tune_value_head", True)
+        value_head_bins = kwargs.pop("value_head_bins", 201)
+        value_head_vmin = kwargs.pop("value_head_vmin", -1.0)
+        value_head_vmax = kwargs.pop("value_head_vmax", 0.0)
+        value_head_pooling = kwargs.pop("value_head_pooling", "masked_mean")
         extra_observation_dims = kwargs.pop("extra_observation_dims", None)
+        primary_action_group_indices = kwargs.pop("primary_action_group_indices", None)
+        secondary_action_group_indices = kwargs.pop("secondary_action_group_indices", None)
+        primary_action_group_loss_weight = kwargs.pop("primary_action_group_loss_weight", None)
+        secondary_action_group_loss_weight = kwargs.pop("secondary_action_group_loss_weight", None)
         upper_body_joint_indices = kwargs.pop("upper_body_joint_indices", None)
         lower_body_joint_indices = kwargs.pop("lower_body_joint_indices", None)
         upper_body_loss_weight = kwargs.pop("upper_body_loss_weight", None)
         lower_body_loss_weight = kwargs.pop("lower_body_loss_weight", None)
+        if primary_action_group_indices is None:
+            primary_action_group_indices = upper_body_joint_indices
+        if secondary_action_group_indices is None:
+            secondary_action_group_indices = lower_body_joint_indices
+        if primary_action_group_loss_weight is None:
+            primary_action_group_loss_weight = upper_body_loss_weight
+        if secondary_action_group_loss_weight is None:
+            secondary_action_group_loss_weight = lower_body_loss_weight
         
         # Extract LoRA parameters for Backbone
         lora_rank = kwargs.pop("lora_rank", 0)
@@ -1026,6 +1149,7 @@ class GR00TN15(PreTrainedModel):
         print(f"Tune action head projector: {tune_projector}")
         print(f"Tune action head vlln: {tune_vlln}")
         print(f"Tune action head DiT: {tune_diffusion_model}")
+        print(f"Value head enabled: {value_head_enable}")
         print(f"Backbone LoRA rank: {lora_rank}")
         print(f"Action Head LoRA rank: {action_head_lora_rank}")
 
@@ -1072,6 +1196,12 @@ class GR00TN15(PreTrainedModel):
         config.action_head_lora_target_modules = action_head_lora_target_modules
         config.tune_top_llm_layers = tune_top_llm_layers
         config.tune_vlln = bool(tune_vlln)
+        config.value_head_enable = bool(value_head_enable)
+        config.tune_value_head = bool(tune_value_head)
+        config.value_head_bins = int(value_head_bins)
+        config.value_head_vmin = float(value_head_vmin)
+        config.value_head_vmax = float(value_head_vmax)
+        config.value_head_pooling = str(value_head_pooling)
         
         # Override backbone model_id if provided (and not using Eagle)
         model_id = kwargs.pop("model_id", None)
@@ -1085,6 +1215,12 @@ class GR00TN15(PreTrainedModel):
             input_prefix = config.backbone_cfg.get("input_prefix")
             if not input_prefix or input_prefix == LEGACY_EAGLE_INPUT_PREFIX:
                 config.backbone_cfg["input_prefix"] = DEFAULT_QWEN_INPUT_PREFIX
+            config.backbone_cfg["value_head_enable"] = bool(value_head_enable)
+            config.backbone_cfg["tune_value_head"] = bool(tune_value_head)
+            config.backbone_cfg["value_head_bins"] = int(value_head_bins)
+            config.backbone_cfg["value_head_vmin"] = float(value_head_vmin)
+            config.backbone_cfg["value_head_vmax"] = float(value_head_vmax)
+            config.backbone_cfg["value_head_pooling"] = str(value_head_pooling)
 
         # Inject attn_implementation if provided (for Qwen backbone)
         attn_implementation = kwargs.pop("attn_implementation", None)
@@ -1094,33 +1230,76 @@ class GR00TN15(PreTrainedModel):
 
         action_head_cfg = dict(config.action_head_cfg)
         action_head_cfg["tune_vlln"] = bool(tune_vlln)
-        if upper_body_joint_indices is not None:
-            action_head_cfg["upper_body_joint_indices"] = list(upper_body_joint_indices)
-        if lower_body_joint_indices is not None:
-            action_head_cfg["lower_body_joint_indices"] = list(lower_body_joint_indices)
-        if upper_body_loss_weight is None:
-            upper_body_loss_weight = action_head_cfg.get(
-                "upper_body_loss_weight",
-                getattr(config, "upper_body_loss_weight", 1.0),
+        if primary_action_group_indices is not None:
+            action_head_cfg["primary_action_group_indices"] = list(primary_action_group_indices)
+        if secondary_action_group_indices is not None:
+            action_head_cfg["secondary_action_group_indices"] = list(secondary_action_group_indices)
+        if "primary_action_group_indices" not in action_head_cfg and "upper_body_joint_indices" in action_head_cfg:
+            action_head_cfg["primary_action_group_indices"] = list(
+                action_head_cfg.get("upper_body_joint_indices") or []
             )
-        if lower_body_loss_weight is None:
-            lower_body_loss_weight = action_head_cfg.get(
-                "lower_body_loss_weight",
-                getattr(config, "lower_body_loss_weight", 1.0),
+        if "secondary_action_group_indices" not in action_head_cfg and "lower_body_joint_indices" in action_head_cfg:
+            action_head_cfg["secondary_action_group_indices"] = list(
+                action_head_cfg.get("lower_body_joint_indices") or []
             )
-        action_head_cfg["upper_body_loss_weight"] = float(upper_body_loss_weight)
-        action_head_cfg["lower_body_loss_weight"] = float(lower_body_loss_weight)
+        if primary_action_group_loss_weight is None:
+            primary_action_group_loss_weight = action_head_cfg.get(
+                "primary_action_group_loss_weight",
+                action_head_cfg.get(
+                    "upper_body_loss_weight",
+                    getattr(
+                        config,
+                        "primary_action_group_loss_weight",
+                        getattr(config, "upper_body_loss_weight", 1.0),
+                    ),
+                ),
+            )
+        if secondary_action_group_loss_weight is None:
+            secondary_action_group_loss_weight = action_head_cfg.get(
+                "secondary_action_group_loss_weight",
+                action_head_cfg.get(
+                    "lower_body_loss_weight",
+                    getattr(
+                        config,
+                        "secondary_action_group_loss_weight",
+                        getattr(config, "lower_body_loss_weight", 1.0),
+                    ),
+                ),
+            )
+        action_head_cfg["primary_action_group_loss_weight"] = float(primary_action_group_loss_weight)
+        action_head_cfg["secondary_action_group_loss_weight"] = float(secondary_action_group_loss_weight)
+        # Mirror to legacy aliases for compatibility with older loaders/metrics.
+        action_head_cfg["upper_body_joint_indices"] = list(action_head_cfg.get("primary_action_group_indices") or [])
+        action_head_cfg["lower_body_joint_indices"] = list(
+            action_head_cfg.get("secondary_action_group_indices") or []
+        )
+        action_head_cfg["upper_body_loss_weight"] = float(
+            action_head_cfg.get("primary_action_group_loss_weight", 1.0)
+        )
+        action_head_cfg["lower_body_loss_weight"] = float(
+            action_head_cfg.get("secondary_action_group_loss_weight", 1.0)
+        )
         config.action_head_cfg = action_head_cfg
-        config.upper_body_joint_indices = list(action_head_cfg.get("upper_body_joint_indices") or [])
-        config.lower_body_joint_indices = list(action_head_cfg.get("lower_body_joint_indices") or [])
-        config.upper_body_loss_weight = float(action_head_cfg.get("upper_body_loss_weight", 1.0))
-        config.lower_body_loss_weight = float(action_head_cfg.get("lower_body_loss_weight", 1.0))
-        if config.upper_body_joint_indices or config.lower_body_joint_indices:
+        config.primary_action_group_indices = list(action_head_cfg.get("primary_action_group_indices") or [])
+        config.secondary_action_group_indices = list(action_head_cfg.get("secondary_action_group_indices") or [])
+        config.primary_action_group_loss_weight = float(
+            action_head_cfg.get("primary_action_group_loss_weight", 1.0)
+        )
+        config.secondary_action_group_loss_weight = float(
+            action_head_cfg.get("secondary_action_group_loss_weight", 1.0)
+        )
+        # Legacy aliases.
+        config.upper_body_joint_indices = list(config.primary_action_group_indices)
+        config.lower_body_joint_indices = list(config.secondary_action_group_indices)
+        config.upper_body_loss_weight = float(config.primary_action_group_loss_weight)
+        config.lower_body_loss_weight = float(config.secondary_action_group_loss_weight)
+        if config.primary_action_group_indices or config.secondary_action_group_indices:
             print(
                 "[GROOT] Joint loss split configured: "
-                f"upper={config.upper_body_joint_indices}, "
-                f"lower={config.lower_body_joint_indices}, "
-                f"weights=({config.upper_body_loss_weight}, {config.lower_body_loss_weight})"
+                f"primary={config.primary_action_group_indices}, "
+                f"secondary={config.secondary_action_group_indices}, "
+                f"weights=({config.primary_action_group_loss_weight}, "
+                f"{config.secondary_action_group_loss_weight})"
             )
 
         # Inject LoRA config into backbone_cfg for QwenBackbone initialization
@@ -1180,6 +1359,7 @@ class GR00TN15(PreTrainedModel):
             pretrained_model.backbone.set_trainable_parameters(
                 tune_vlm=tune_vlm,
                 tune_projector=tune_vlm_projector,
+                tune_value_head=tune_value_head,
                 tune_top_llm_layers=tune_top_llm_layers,
             )
         else:

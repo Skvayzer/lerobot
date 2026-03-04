@@ -16,6 +16,7 @@
 import logging
 import os
 import re
+import hashlib
 from glob import glob
 from pathlib import Path
 
@@ -26,16 +27,46 @@ from lerobot.configs.train import TrainPipelineConfig
 from lerobot.utils.constants import PRETRAINED_MODEL_DIR
 
 
+_WANDB_MAX_TAG_LEN = 64
+
+
+def _sanitize_tag_value(value: object) -> str:
+    text = str(value).strip()
+    # Keep only a conservative character set for tags.
+    text = re.sub(r"[^A-Za-z0-9_.:/-]+", "_", text)
+    text = text.strip("._-")
+    return text or "unknown"
+
+
+def _make_tag(prefix: str, value: object) -> str:
+    prefix = _sanitize_tag_value(prefix)
+    value = _sanitize_tag_value(value)
+    tag = f"{prefix}:{value}"
+    if len(tag) <= _WANDB_MAX_TAG_LEN:
+        return tag
+
+    # Keep tags deterministic and within W&B limit.
+    digest = hashlib.sha1(tag.encode("utf-8")).hexdigest()[:10]
+    budget = _WANDB_MAX_TAG_LEN - len(prefix) - len(":~") - len(digest)
+    short_value = value[: max(1, budget)]
+    return f"{prefix}:{short_value}~{digest}"
+
+
 def cfg_to_group(cfg: TrainPipelineConfig, return_list: bool = False) -> list[str] | str:
     """Return a group name for logging. Optionally returns group name as list."""
     lst = [
-        f"policy:{cfg.policy.type}",
-        f"seed:{cfg.seed}",
+        _make_tag("policy", cfg.policy.type),
+        _make_tag("seed", cfg.seed),
     ]
     if cfg.dataset is not None:
-        lst.append(f"dataset:{cfg.dataset.repo_id}")
+        repo_id = getattr(cfg.dataset, "repo_id", None)
+        # For mixed datasets (list/tuple/set), use stable compact tag.
+        if isinstance(repo_id, (list, tuple, set)):
+            lst.append(_make_tag("dataset", f"multi_{len(repo_id)}"))
+        else:
+            lst.append(_make_tag("dataset", repo_id))
     if cfg.env is not None:
-        lst.append(f"env:{cfg.env.type}")
+        lst.append(_make_tag("env", cfg.env.type))
     return lst if return_list else "-".join(lst)
 
 

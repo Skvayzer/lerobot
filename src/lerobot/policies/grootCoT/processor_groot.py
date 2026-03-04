@@ -37,6 +37,7 @@ from lerobot.configs.types import (
     PolicyFeature,
 )
 from lerobot.policies.grootCoT.configuration_groot import GrootCoTConfig
+from lerobot.policies.grootCoT.system2_vlm_registry import DEFAULT_SYSTEM2_VLM_MODEL_ID
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
     DeviceProcessorStep,
@@ -57,7 +58,7 @@ from lerobot.utils.constants import (
 )
 
 # Defaults for VLM processor locations
-DEFAULT_QWEN_PROCESSOR_MODEL_ID = "Qwen/Qwen3-VL-8B-Thinking"
+DEFAULT_QWEN_PROCESSOR_MODEL_ID = DEFAULT_SYSTEM2_VLM_MODEL_ID
 SUMMARY_TOKEN = "<SUMMARY>"
 SUMMARY_PROMPT = "Think briefly (<=20 tokens), then summarize. " + SUMMARY_TOKEN
 QWEN_CONTENT_KEY = "qwen_content"

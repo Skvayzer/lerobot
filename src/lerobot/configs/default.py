@@ -169,3 +169,17 @@ class EvalConfig:
                 f"to increase the number of episodes to match the batch size (e.g. `eval.n_episodes={self.batch_size}`), "
                 f"or lower the batch size (e.g. `eval.batch_size={self.n_episodes}`)."
             )
+
+
+@dataclass
+class PeftConfig:
+    """Optional PEFT override config used by train pipeline when --peft.* CLI args are provided."""
+
+    peft_type: str | None = None
+    task_type: str | None = None
+    r: int | None = None
+    lora_alpha: int | None = None
+    lora_dropout: float | None = None
+    bias: str | None = None
+    target_modules: list[str] | None = None
+    modules_to_save: list[str] | None = None

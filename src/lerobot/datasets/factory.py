@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
+import inspect
 from pathlib import Path
 from pprint import pformat
 from types import SimpleNamespace
@@ -459,16 +460,20 @@ def make_dataset(
             episodes_per_repo[repo_id] = _resolve_filtered_episodes(cfg, ds_meta)
             tolerances_s[repo_id] = cfg.tolerance_s
 
-        dataset = MultiLeRobotDataset(
-            repo_ids,
-            root=cfg.dataset.root,
-            episodes=episodes_per_repo,
-            image_transforms=image_transforms,
-            delta_timestamps=delta_timestamps,
-            tolerances_s=tolerances_s,
-            video_backend=cfg.dataset.video_backend,
-            tolerance_s=cfg.dataset.tolerance_s,
-        )
+        multi_dataset_kwargs = {
+            "root": cfg.dataset.root,
+            "episodes": episodes_per_repo,
+            "image_transforms": image_transforms,
+            "delta_timestamps": delta_timestamps,
+            "video_backend": cfg.dataset.video_backend,
+        }
+        multi_dataset_sig = inspect.signature(MultiLeRobotDataset.__init__).parameters
+        if "tolerances_s" in multi_dataset_sig:
+            multi_dataset_kwargs["tolerances_s"] = tolerances_s
+        if "tolerance_s" in multi_dataset_sig:
+            multi_dataset_kwargs["tolerance_s"] = cfg.dataset.tolerance_s
+
+        dataset = MultiLeRobotDataset(repo_ids, **multi_dataset_kwargs)
         dataset.meta = _build_multi_dataset_meta(dataset)
         logging.info(
             "Multiple datasets were provided. Applied the following index mapping to the provided datasets: "

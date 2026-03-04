@@ -25,3 +25,36 @@ Code: https://github.com/NVIDIA/Isaac-GR00T
 Blog: https://developer.nvidia.com/isaac/gr00t
 
 Hugging Face Model: https://huggingface.co/nvidia/GR00T-N1.5-3B
+
+## System-2 VLM Selection (GrootCoT)
+
+GrootCoT exposes an explicit selector for the System-2 backbone VLM.
+
+### Use Qwen3-VL 8B Instruct by preset
+
+```bash
+python src/lerobot/scripts/lerobot_train.py \
+  --policy.type=groot_cot \
+  --policy.system2_vlm_preset=qwen3_vl_8b_instruct
+```
+
+### Use an explicit HF model id
+
+```bash
+python src/lerobot/scripts/lerobot_train.py \
+  --policy.type=groot_cot \
+  --policy.system2_vlm_model_id=Qwen/Qwen3-VL-8B-Instruct
+```
+
+### Legacy compatibility (still supported)
+
+```bash
+python src/lerobot/scripts/lerobot_train.py \
+  --policy.type=groot_cot \
+  --policy.vlm_processor_model_id=Qwen/Qwen3-VL-8B-Instruct
+```
+
+Resolution precedence:
+1. `policy.system2_vlm_model_id`
+2. `policy.system2_vlm_preset`
+3. `policy.vlm_processor_model_id` (legacy compatibility field)
