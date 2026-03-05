@@ -16,6 +16,7 @@
 import glob
 import importlib
 import logging
+import math
 import shutil
 import tempfile
 import warnings
@@ -107,36 +108,55 @@ def decode_video_frames_torchvision(
     if backend == "pyav":
         keyframes_only = True  # pyav doesn't support accurate seek
 
-    # set a video stream reader
-    # TODO(rcadene): also load audio stream at the same time
-    reader = torchvision.io.VideoReader(video_path, "video")
-
     # set the first and last requested timestamps
     # Note: previous timestamps are usually loaded, since we need to access the previous key frame
     first_ts = min(timestamps)
     last_ts = max(timestamps)
 
-    # access closest key frame of the first requested frame
-    # Note: closest key frame timestamp is usually smaller than `first_ts` (e.g. key frame can be the first frame of the video)
-    # for details on what `seek` is doing see: https://pyav.basswood-io.com/docs/stable/api/container.html?highlight=inputcontainer#av.container.InputContainer.seek
-    reader.seek(first_ts, keyframes_only=keyframes_only)
+    def _load_frames_from_seek(seek_ts: float) -> tuple[list[torch.Tensor], list[float]]:
+        # TODO(rcadene): also load audio stream at the same time
+        reader = torchvision.io.VideoReader(video_path, "video")
+        # Access closest key frame of the first requested frame.
+        # Note: closest key frame timestamp is usually smaller than seek timestamp.
+        reader.seek(seek_ts, keyframes_only=keyframes_only)
 
-    # load all frames until last requested frame
-    loaded_frames = []
-    loaded_ts = []
-    for frame in reader:
-        current_ts = frame["pts"]
-        if log_loaded_timestamps:
-            logging.info(f"frame loaded at timestamp={current_ts:.4f}")
-        loaded_frames.append(frame["data"])
-        loaded_ts.append(current_ts)
-        if current_ts >= last_ts:
-            break
+        frames: list[torch.Tensor] = []
+        ts_values: list[float] = []
+        for frame in reader:
+            current_ts = frame["pts"]
+            if log_loaded_timestamps:
+                logging.info(f"frame loaded at timestamp={current_ts:.4f}")
+            frames.append(frame["data"])
+            ts_values.append(current_ts)
+            if current_ts >= last_ts:
+                break
 
-    if backend == "pyav":
-        reader.container.close()
+        if backend == "pyav":
+            reader.container.close()
+        reader = None
+        return frames, ts_values
 
-    reader = None
+    loaded_frames, loaded_ts = _load_frames_from_seek(first_ts)
+
+    # Boundary seek can occasionally return no frames (pyav/video_reader edge case).
+    # Retry from slightly earlier timestamp before failing.
+    if not loaded_ts:
+        retry_seek_ts = max(0.0, first_ts - max(tolerance_s, 1.0))
+        logging.warning(
+            "No frames decoded for %s at seek_ts=%.6f (backend=%s). Retrying from %.6f.",
+            video_path,
+            first_ts,
+            backend,
+            retry_seek_ts,
+        )
+        loaded_frames, loaded_ts = _load_frames_from_seek(retry_seek_ts)
+
+    if not loaded_ts:
+        raise RuntimeError(
+            "No frames decoded from video. "
+            f"video={video_path}, backend={backend}, first_ts={first_ts}, last_ts={last_ts}, "
+            f"query_timestamps={timestamps}"
+        )
 
     query_ts = torch.tensor(timestamps)
     loaded_ts = torch.tensor(loaded_ts)
@@ -253,16 +273,40 @@ def decode_video_frames_torchcodec(
     # get metadata for frame information
     metadata = decoder.metadata
     average_fps = metadata.average_fps
-    # convert timestamps to frame indices
-    frame_indices = [round(ts * average_fps) for ts in timestamps]
-    # retrieve frames based on indices
-    frames_batch = decoder.get_frames_at(indices=frame_indices)
+    # Convert timestamps to frame indices.
+    # Use floor (not round) to avoid requesting one frame past EOF due to boundary timestamps.
+    frame_indices = [max(0, int(math.floor(ts * average_fps))) for ts in timestamps]
+
+    # Retrieve frames based on indices. Some videos/timestamps can still hit EOF boundary in torchcodec;
+    # retry with indices shifted one frame back.
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            frames_batch = decoder.get_frames_at(indices=frame_indices)
+            break
+        except RuntimeError as exc:
+            msg = str(exc).lower()
+            if "no more frames left to decode" not in msg or attempt == max_retries - 1:
+                raise
+            frame_indices = [max(0, idx - 1) for idx in frame_indices]
+            logging.warning(
+                "torchcodec EOF boundary hit for %s (attempt %d/%d); retrying with shifted indices.",
+                video_path,
+                attempt + 1,
+                max_retries,
+            )
 
     for frame, pts in zip(frames_batch.data, frames_batch.pts_seconds, strict=True):
         loaded_frames.append(frame)
         loaded_ts.append(pts.item())
         if log_loaded_timestamps:
             logging.info(f"Frame loaded at timestamp={pts:.4f}")
+
+    if not loaded_ts:
+        raise RuntimeError(
+            "torchcodec returned no decoded frames after retries. "
+            f"video={video_path}, query_timestamps={timestamps}, frame_indices={frame_indices}"
+        )
 
     query_ts = torch.tensor(timestamps)
     loaded_ts = torch.tensor(loaded_ts)
