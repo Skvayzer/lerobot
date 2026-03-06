@@ -91,8 +91,13 @@ def _is_recoverable_video_error(exc: Exception) -> bool:
         return True
     if isinstance(exc, AssertionError) and "ignore this item during training" in msg:
         return True
-    if isinstance(exc, RuntimeError) and "no more frames left to decode" in msg:
-        return True
+    if isinstance(exc, RuntimeError):
+        recoverable_patterns = (
+            "no more frames left to decode",  # torchcodec boundary/EOF
+            "no frames decoded from video",  # pyav/video_reader empty decode
+        )
+        if any(pattern in msg for pattern in recoverable_patterns):
+            return True
     return False
 
 
