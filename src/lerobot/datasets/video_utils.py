@@ -315,9 +315,27 @@ def decode_video_frames_torchcodec(
     dist = torch.cdist(query_ts[:, None], loaded_ts[:, None], p=1)
     min_, argmin_ = dist.min(1)
 
-    is_within_tol = min_ < tolerance_s
+    # torchcodec can occasionally return frames off by exactly one frame period near boundaries.
+    # Keep strict tolerance by default, but allow a one-frame fallback before failing.
+    effective_tolerance_s = tolerance_s
+    is_within_tol = min_ < effective_tolerance_s
+    if not is_within_tol.all():
+        frame_period_s = float("inf") if average_fps is None else 1.0 / float(average_fps)
+        relaxed_tolerance_s = max(tolerance_s, frame_period_s + 1e-6)
+        relaxed_within_tol = min_ < relaxed_tolerance_s
+        if relaxed_within_tol.all():
+            logging.warning(
+                "torchcodec frame-time mismatch within one frame for %s. "
+                "Relaxing tolerance from %.6f to %.6f for this sample.",
+                video_path,
+                tolerance_s,
+                relaxed_tolerance_s,
+            )
+            effective_tolerance_s = relaxed_tolerance_s
+            is_within_tol = relaxed_within_tol
+
     assert is_within_tol.all(), (
-        f"One or several query timestamps unexpectedly violate the tolerance ({min_[~is_within_tol]} > {tolerance_s=})."
+        f"One or several query timestamps unexpectedly violate the tolerance ({min_[~is_within_tol]} > effective_tolerance_s={effective_tolerance_s})."
         "It means that the closest frame that can be loaded from the video is too far away in time."
         "This might be due to synchronization issues with timestamps during data collection."
         "To be safe, we advise to ignore this item during training."
