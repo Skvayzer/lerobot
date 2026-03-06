@@ -113,6 +113,14 @@ def _summarize_patterns(patterns: list[str] | str | None) -> str:
     return f"{len(patterns)} paths [{preview}{suffix}]"
 
 
+def _clone_item_tensors(item: dict) -> dict:
+    """Clone tensor values to safely reuse a cached sample across workers."""
+    cloned = {}
+    for key, val in item.items():
+        cloned[key] = val.clone() if torch.is_tensor(val) else val
+    return cloned
+
+
 def _snapshot_download_with_logging(
     repo_id: str,
     revision: str,
@@ -842,6 +850,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.delta_indices = None
         self.batch_encoding_size = batch_encoding_size
         self.episodes_since_last_encoding = 0
+        self._last_valid_item: dict | None = None
 
         # Unused attributes
         self.image_writer = None
@@ -1173,7 +1182,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
         # Ensure dataset is loaded when we actually need to read from it
         self._ensure_hf_dataset_loaded()
 
-        max_attempts = 16
+        dataset_len = len(self)
+        max_attempts = 64
         original_idx = idx
         last_exc: Exception | None = None
 
@@ -1204,13 +1214,18 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 # Add task as a string
                 task_idx = item["task_index"].item()
                 item["task"] = self.meta.tasks.iloc[task_idx].name
+                self._last_valid_item = item
                 return item
             except Exception as exc:  # noqa: BLE001 - keep per-sample decode failures from crashing training.
-                if not _is_recoverable_video_error(exc) or len(self) <= 1:
+                if not _is_recoverable_video_error(exc) or dataset_len <= 1:
                     raise
                 last_exc = exc
-                # Advance deterministically to avoid repeatedly sampling the same bad record.
-                idx = (idx + 1 + attempt) % len(self)
+                # Escape local corrupted regions by switching from local to non-local jumps.
+                if attempt < 8:
+                    idx = (idx + 1 + attempt) % dataset_len
+                else:
+                    jump = (attempt + 1) * 7919 + attempt * attempt
+                    idx = (original_idx + jump) % dataset_len
                 if attempt in {0, 4, 9, max_attempts - 1}:
                     logging.warning(
                         "Skipping corrupted/unsynced video sample in dataset '%s' "
@@ -1222,6 +1237,17 @@ class LeRobotDataset(torch.utils.data.Dataset):
                         idx,
                         exc,
                     )
+
+        if self._last_valid_item is not None:
+            logging.error(
+                "Failed to fetch a valid sample after %d attempts (start_idx=%d, repo_id=%s). "
+                "Returning cached fallback sample to keep training alive. Last error: %s",
+                max_attempts,
+                original_idx,
+                self.repo_id,
+                last_exc,
+            )
+            return _clone_item_tensors(self._last_valid_item)
 
         raise RuntimeError(
             f"Failed to fetch a valid sample after {max_attempts} attempts "
