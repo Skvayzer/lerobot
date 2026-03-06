@@ -127,6 +127,7 @@ def _snapshot_download_with_logging(
     local_dir: Path,
     allow_patterns: list[str] | str | None = None,
     ignore_patterns: list[str] | str | None = None,
+    force_download: bool = False,
 ) -> str:
     expected_total_files: int | None = len(allow_patterns) if isinstance(allow_patterns, list) else None
 
@@ -190,6 +191,7 @@ def _snapshot_download_with_logging(
             local_dir=local_dir,
             allow_patterns=allow_patterns,
             ignore_patterns=ignore_patterns,
+            force_download=force_download,
         )
     finally:
         stop_event.set()
@@ -325,6 +327,7 @@ class LeRobotDatasetMetadata:
         self,
         allow_patterns: list[str] | str | None = None,
         ignore_patterns: list[str] | str | None = None,
+        force_download: bool = False,
     ) -> None:
         _snapshot_download_with_logging(
             repo_id=self.repo_id,
@@ -332,6 +335,7 @@ class LeRobotDatasetMetadata:
             local_dir=self.root,
             allow_patterns=allow_patterns,
             ignore_patterns=ignore_patterns,
+            force_download=force_download,
         )
 
     @property
@@ -851,6 +855,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.batch_encoding_size = batch_encoding_size
         self.episodes_since_last_encoding = 0
         self._last_valid_item: dict | None = None
+        self._redownloaded_video_files: set[str] = set()
 
         # Unused attributes
         self.image_writer = None
@@ -962,6 +967,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self,
         allow_patterns: list[str] | str | None = None,
         ignore_patterns: list[str] | str | None = None,
+        force_download: bool = False,
     ) -> None:
         _snapshot_download_with_logging(
             repo_id=self.repo_id,
@@ -969,7 +975,41 @@ class LeRobotDataset(torch.utils.data.Dataset):
             local_dir=self.root,
             allow_patterns=allow_patterns,
             ignore_patterns=ignore_patterns,
+            force_download=force_download,
         )
+
+    def _maybe_redownload_video_file(self, rel_video_path: Path, cause: Exception) -> bool:
+        rel_video_path_str = str(rel_video_path).replace("\\", "/")
+        if rel_video_path_str in self._redownloaded_video_files:
+            return False
+        self._redownloaded_video_files.add(rel_video_path_str)
+
+        logging.warning(
+            "Attempting one-time force re-download for video file '%s' in dataset '%s' after decode error: %s",
+            rel_video_path_str,
+            self.repo_id,
+            cause,
+        )
+        try:
+            self.pull_from_repo(allow_patterns=[rel_video_path_str], ignore_patterns=None, force_download=True)
+        except Exception as download_exc:  # noqa: BLE001 - keep training alive on network/cache failures
+            logging.warning(
+                "Force re-download failed for '%s' in dataset '%s': %s",
+                rel_video_path_str,
+                self.repo_id,
+                download_exc,
+            )
+            return False
+
+        redownloaded_video_path = self.root / rel_video_path
+        if not redownloaded_video_path.exists():
+            logging.warning(
+                "Re-download completed but video file is still missing: '%s' (dataset='%s').",
+                redownloaded_video_path,
+                self.repo_id,
+            )
+            return False
+        return True
 
     def download(self, download_videos: bool = True) -> None:
         """Downloads the dataset from the given 'repo_id' at the provided version. If 'episodes' is given, this
@@ -1159,8 +1199,16 @@ class LeRobotDataset(torch.utils.data.Dataset):
             from_timestamp = ep.get(f"videos/{vid_key}/from_timestamp", 0.0)
             shifted_query_ts = [from_timestamp + ts for ts in query_ts]
 
-            video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
-            frames = decode_video_frames(video_path, shifted_query_ts, self.tolerance_s, self.video_backend)
+            rel_video_path = self.meta.get_video_file_path(ep_idx, vid_key)
+            video_path = self.root / rel_video_path
+            try:
+                frames = decode_video_frames(video_path, shifted_query_ts, self.tolerance_s, self.video_backend)
+            except Exception as exc:
+                if not _is_recoverable_video_error(exc):
+                    raise
+                if not self._maybe_redownload_video_file(rel_video_path, exc):
+                    raise
+                frames = decode_video_frames(video_path, shifted_query_ts, self.tolerance_s, self.video_backend)
             item[vid_key] = frames.squeeze(0)
 
         return item
