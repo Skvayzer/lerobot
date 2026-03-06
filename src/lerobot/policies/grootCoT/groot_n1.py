@@ -16,6 +16,7 @@
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
+import os
 import re
 
 import numpy as np
@@ -134,25 +135,28 @@ class QwenBackbone(nn.Module):
         if attn_implementation is not None:
             load_kwargs["attn_implementation"] = attn_implementation
 
-        # Prefer the multimodal VL class; fall back to generic vision2seq, then causal LM, then base AutoModel.
-        try:
-            # Try specific Qwen2VL class if available (transformers>=4.45)
-            from transformers import Qwen2VLForConditionalGeneration
-            self.qwen_model = Qwen2VLForConditionalGeneration.from_pretrained(model_id, **load_kwargs)
-        except (ImportError, Exception):
-            # Fallback to AutoModel (best for general compatibility)
+        # Prefer a class that matches the config model_type to avoid partial/random initialization.
+        model_type = str(getattr(self.qwen_config, "model_type", "")).lower()
+        if model_type.startswith("qwen3_vl") and Qwen3VLForConditionalGeneration is not None:
+            self.qwen_model = Qwen3VLForConditionalGeneration.from_pretrained(model_id, **load_kwargs)
+        else:
             try:
-                self.qwen_model = AutoModel.from_pretrained(model_id, **load_kwargs)
-            except Exception:
+                # Try specific Qwen2VL class if available (transformers>=4.45)
+                from transformers import Qwen2VLForConditionalGeneration
+
+                self.qwen_model = Qwen2VLForConditionalGeneration.from_pretrained(model_id, **load_kwargs)
+            except (ImportError, Exception):
+                # Fallback to AutoModel (best for general compatibility)
                 try:
-                    self.qwen_model = AutoModelForVision2Seq.from_pretrained(model_id, **load_kwargs)
+                    self.qwen_model = AutoModel.from_pretrained(model_id, **load_kwargs)
                 except Exception:
-                     # Last resort: Qwen3VL if strictly needed for Qwen2.5-VL compatibility in older transformers?
-                     # But current issue is using Qwen3 for Qwen2.
-                     if Qwen3VLForConditionalGeneration is not None:
-                         self.qwen_model = Qwen3VLForConditionalGeneration.from_pretrained(model_id, **load_kwargs)
-                     else:
-                         self.qwen_model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
+                    try:
+                        self.qwen_model = AutoModelForVision2Seq.from_pretrained(model_id, **load_kwargs)
+                    except Exception:
+                        if Qwen3VLForConditionalGeneration is not None:
+                            self.qwen_model = Qwen3VLForConditionalGeneration.from_pretrained(model_id, **load_kwargs)
+                        else:
+                            self.qwen_model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
         
         print(f"[GROOT] Initialized QwenBackbone with model class: {type(self.qwen_model)}")
         try:
@@ -1329,31 +1333,30 @@ class GR00TN15(PreTrainedModel):
             local_model_path, config=config, local_model_path=local_model_path, **kwargs
         )
 
-        # Re-initialize Qwen Backbone to ensure no contamination from GR00T checkpoint
-        # (e.g. key collisions with Eagle backbone in the checkpoint)
-        if hasattr(pretrained_model, "backbone") and isinstance(pretrained_model.backbone, QwenBackbone):
-             print("[GROOT] Re-initializing Qwen Backbone to purge potential checkpoint contamination...")
-             # Re-create backbone using the configuration
-             # Note: config.backbone_cfg is a dict
-             # Rebuild LoRA config for Qwen backbone (if any)
-             lora_cfg = getattr(pretrained_model.config, "lora_config", {})
-             if not lora_cfg:
-                 lora_cfg = {
-                     "r": getattr(pretrained_model.config, "lora_rank", 0),
-                     "lora_alpha": getattr(pretrained_model.config, "lora_alpha", 16),
-                     "lora_dropout": getattr(pretrained_model.config, "lora_dropout", 0.05),
-                     "target_modules": getattr(pretrained_model.config, "lora_target_modules", None),
-                 }
-             backbone_cfg = dict(pretrained_model.config.backbone_cfg)
-             # Avoid passing lora_config twice (via backbone_cfg and explicit kwarg).
-             backbone_cfg.pop("lora_config", None)
-             pretrained_model.backbone = QwenBackbone(**backbone_cfg, lora_config=lora_cfg)
-             # Move to device and dtype matching the model
-             # (Actually the model is likely on CPU or meta device here if loaded via from_pretrained?)
-             # But we need it to match.
-             # AutoModel loading in QwenBackbone handles device placement usually? 
-             # No, it loads to default. We should let accelerate handle device placement later.
-             # One nuance: if load_bf16 was used, QwenBackbone init handles it.
+        # Optional heavy safety path: re-initialize Qwen backbone after checkpoint load.
+        # Disabled by default because it doubles startup memory usage on multi-GPU launches.
+        force_backbone_reinit = os.getenv("GROOT_FORCE_BACKBONE_REINIT", "0").strip() == "1"
+        if (
+            force_backbone_reinit
+            and hasattr(pretrained_model, "backbone")
+            and isinstance(pretrained_model.backbone, QwenBackbone)
+        ):
+            print("[GROOT] Re-initializing Qwen Backbone to purge potential checkpoint contamination...")
+            # Re-create backbone using the configuration
+            # Note: config.backbone_cfg is a dict
+            # Rebuild LoRA config for Qwen backbone (if any)
+            lora_cfg = getattr(pretrained_model.config, "lora_config", {})
+            if not lora_cfg:
+                lora_cfg = {
+                    "r": getattr(pretrained_model.config, "lora_rank", 0),
+                    "lora_alpha": getattr(pretrained_model.config, "lora_alpha", 16),
+                    "lora_dropout": getattr(pretrained_model.config, "lora_dropout", 0.05),
+                    "target_modules": getattr(pretrained_model.config, "lora_target_modules", None),
+                }
+            backbone_cfg = dict(pretrained_model.config.backbone_cfg)
+            # Avoid passing lora_config twice (via backbone_cfg and explicit kwarg).
+            backbone_cfg.pop("lora_config", None)
+            pretrained_model.backbone = QwenBackbone(**backbone_cfg, lora_config=lora_cfg)
 
         if isinstance(pretrained_model.backbone, QwenBackbone):
             pretrained_model.backbone.set_trainable_parameters(
