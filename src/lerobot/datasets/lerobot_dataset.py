@@ -70,6 +70,7 @@ from lerobot.datasets.utils import (
     write_tasks,
 )
 from lerobot.datasets.video_utils import (
+    FrameTimestampError,
     VideoFrame,
     concatenate_video_files,
     decode_video_frames,
@@ -81,6 +82,18 @@ from lerobot.datasets.video_utils import (
 from lerobot.utils.constants import HF_LEROBOT_HOME
 
 CODEBASE_VERSION = "v3.0"
+
+
+def _is_recoverable_video_error(exc: Exception) -> bool:
+    """Return True for known per-sample video decode issues that should be skipped."""
+    msg = str(exc).lower()
+    if isinstance(exc, FrameTimestampError):
+        return True
+    if isinstance(exc, AssertionError) and "ignore this item during training" in msg:
+        return True
+    if isinstance(exc, RuntimeError) and "no more frames left to decode" in msg:
+        return True
+    return False
 
 
 def _summarize_patterns(patterns: list[str] | str | None) -> str:
@@ -1154,32 +1167,61 @@ class LeRobotDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx) -> dict:
         # Ensure dataset is loaded when we actually need to read from it
         self._ensure_hf_dataset_loaded()
-        item = self.hf_dataset[idx]
-        ep_idx = item["episode_index"].item()
 
-        query_indices = None
-        if self.delta_indices is not None:
-            query_indices, padding = self._get_query_indices(idx, ep_idx)
-            query_result = self._query_hf_dataset(query_indices)
-            item = {**item, **padding}
-            for key, val in query_result.items():
-                item[key] = val
+        max_attempts = 16
+        original_idx = idx
+        last_exc: Exception | None = None
 
-        if len(self.meta.video_keys) > 0:
-            current_ts = item["timestamp"].item()
-            query_timestamps = self._get_query_timestamps(current_ts, query_indices)
-            video_frames = self._query_videos(query_timestamps, ep_idx)
-            item = {**video_frames, **item}
+        for attempt in range(max_attempts):
+            try:
+                item = self.hf_dataset[idx]
+                ep_idx = item["episode_index"].item()
 
-        if self.image_transforms is not None:
-            image_keys = self.meta.camera_keys
-            for cam in image_keys:
-                item[cam] = self.image_transforms(item[cam])
+                query_indices = None
+                if self.delta_indices is not None:
+                    query_indices, padding = self._get_query_indices(idx, ep_idx)
+                    query_result = self._query_hf_dataset(query_indices)
+                    item = {**item, **padding}
+                    for key, val in query_result.items():
+                        item[key] = val
 
-        # Add task as a string
-        task_idx = item["task_index"].item()
-        item["task"] = self.meta.tasks.iloc[task_idx].name
-        return item
+                if len(self.meta.video_keys) > 0:
+                    current_ts = item["timestamp"].item()
+                    query_timestamps = self._get_query_timestamps(current_ts, query_indices)
+                    video_frames = self._query_videos(query_timestamps, ep_idx)
+                    item = {**video_frames, **item}
+
+                if self.image_transforms is not None:
+                    image_keys = self.meta.camera_keys
+                    for cam in image_keys:
+                        item[cam] = self.image_transforms(item[cam])
+
+                # Add task as a string
+                task_idx = item["task_index"].item()
+                item["task"] = self.meta.tasks.iloc[task_idx].name
+                return item
+            except Exception as exc:  # noqa: BLE001 - keep per-sample decode failures from crashing training.
+                if not _is_recoverable_video_error(exc) or len(self) <= 1:
+                    raise
+                last_exc = exc
+                # Advance deterministically to avoid repeatedly sampling the same bad record.
+                idx = (idx + 1 + attempt) % len(self)
+                if attempt in {0, 4, 9, max_attempts - 1}:
+                    logging.warning(
+                        "Skipping corrupted/unsynced video sample in dataset '%s' "
+                        "(idx=%d, retry=%d/%d, next_idx=%d): %s",
+                        self.repo_id,
+                        original_idx,
+                        attempt + 1,
+                        max_attempts,
+                        idx,
+                        exc,
+                    )
+
+        raise RuntimeError(
+            f"Failed to fetch a valid sample after {max_attempts} attempts "
+            f"(start_idx={original_idx}, repo_id={self.repo_id})."
+        ) from last_exc
 
     def __repr__(self):
         feature_keys = list(self.features)
