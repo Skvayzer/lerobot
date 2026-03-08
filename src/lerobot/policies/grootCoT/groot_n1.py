@@ -127,11 +127,17 @@ class QwenBackbone(nn.Module):
         self.value_head_vmax = float(value_head_vmax)
         self._tokenizer = None
 
+        _is_rocm_early = getattr(torch.version, "hip", None) is not None
         dtype = torch.bfloat16 if load_bf16 else None
         self.qwen_config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
         load_kwargs = {"trust_remote_code": True}
         if dtype is not None:
             load_kwargs["torch_dtype"] = dtype
+        elif _is_rocm_early:
+            # On ROCm, force FP32 to override model config "bfloat16" default.
+            # BF16 ViT on AMD MI210 (gfx90a) produces NaN even with eager attention.
+            load_kwargs["dtype"] = torch.float32
+            print(f"[GROOT] ROCm: forcing dtype=float32 (hip={torch.version.hip}) to prevent ViT NaN.", flush=True)
         if attn_implementation is not None:
             load_kwargs["attn_implementation"] = attn_implementation
 
@@ -159,6 +165,39 @@ class QwenBackbone(nn.Module):
                             self.qwen_model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
         
         print(f"[GROOT] Initialized QwenBackbone with model class: {type(self.qwen_model)}")
+        # AMD ROCm workaround: BF16 precision in the visual encoder (ViT) produces NaN
+        # on gfx90a (MI210) GPUs due to BF16 overflow in attention matmuls.
+        # Cast the visual encoder to FP32 for numerical stability while keeping the
+        # LLM in BF16 for memory efficiency.
+        # Note: check torch.version.hip directly (not torch.cuda.is_available(), which
+        # may return False during distributed init before CUDA is fully set up).
+        _is_rocm = getattr(torch.version, "hip", None) is not None
+        print(f"[GROOT] ROCm check: load_bf16={load_bf16}, hip={getattr(torch.version, chr(39)+chr(104)+chr(105)+chr(112), None)}, _is_rocm={_is_rocm}", flush=True)
+        if _is_rocm:
+            _vit_cast_done = False
+            for _vit_attr in ("visual", "vision_model", "vision_tower", "visual_encoder"):
+                if hasattr(self.qwen_model, _vit_attr):
+                    getattr(self.qwen_model, _vit_attr).float()
+                    print(f"[GROOT] AMD ROCm: cast Qwen3VL .{_vit_attr} to FP32 (hip={torch.version.hip}) to prevent BF16 NaN.", flush=True)
+                    _vit_cast_done = True
+                    break
+            if not _vit_cast_done:
+                print("[GROOT] AMD ROCm: WARNING — could not find visual encoder attr to cast to FP32. NaN may occur.", flush=True)
+        # Diagnostic hook: print ViT output stats for first 3 forward passes
+        _hook_calls = [0]
+        def _vit_diag_hook(module, inp, out):
+            _hook_calls[0] += 1
+            if _hook_calls[0] > 3:
+                return
+            x = out[0] if isinstance(out, (tuple, list)) else out
+            if torch.isnan(x).any():
+                print(f"[GROOT] ViT output NaN #{_hook_calls[0]}: {torch.isnan(x).sum()}/{x.numel()} NaN, dtype={x.dtype}", flush=True)
+            else:
+                print(f"[GROOT] ViT output OK #{_hook_calls[0]}: min={x.min().item():.3f}, max={x.max().item():.3f}, dtype={x.dtype}", flush=True)
+        for _vit_attr2 in ("visual", "vision_model", "vision_tower", "visual_encoder"):
+            if hasattr(self.qwen_model, _vit_attr2):
+                getattr(self.qwen_model, _vit_attr2).register_forward_hook(_vit_diag_hook)
+                break
         try:
             self._tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
         except Exception as exc:
@@ -369,6 +408,18 @@ class QwenBackbone(nn.Module):
         return hidden_states[idx]
 
     def forward_qwen(self, vl_input: BatchFeature) -> tuple[torch.Tensor, torch.Tensor | None]:
+        # Re-cast ViT to FP32 on first forward call.
+        # Accelerate DDP wrapping can reset dtype; this catches that.
+        if not getattr(self, "_vit_fp32_ensured", False) and getattr(torch.version, "hip", None) is not None:
+            base = getattr(self.qwen_model, "module", self.qwen_model)
+            for _attr in ("visual", "vision_model", "vision_tower", "visual_encoder"):
+                if hasattr(base, _attr):
+                    _vit = getattr(base, _attr)
+                    _vit.float()
+                    _dtype = next(_vit.parameters()).dtype
+                    print(f"[GROOT] forward_qwen: re-cast .{_attr} to FP32, param_dtype={_dtype}", flush=True)
+                    break
+            self._vit_fp32_ensured = True
         qwen_input, _ = self._collect_prefixed_inputs(vl_input)
         if not qwen_input:
             raise ValueError(
@@ -396,27 +447,12 @@ class QwenBackbone(nn.Module):
             ).unsqueeze(0).expand(b, -1)
             qwen_input["image_grid_thw"] = grid
 
-        # Debug input stats to trace NaNs/shape issues.
+        # Sanity check: log only if NaN appears in pixel_values.
         pv = qwen_input.get("pixel_values")
-        if pv is not None:
-            if torch.isnan(pv).any():
-                nan_count = torch.isnan(pv).sum().item()
-                print(f"[GROOT][DEBUG] NaNs in pixel_values before Qwen: count={nan_count}, shape={tuple(pv.shape)}")
-                torch.save(vl_input, "debug_nan_input_pre.pt")
-                print("Saved debug_nan_input_pre.pt")
-            else:
-                with torch.no_grad():
-                    print(
-                        "[GROOT][DEBUG] pixel_values stats: "
-                        f"shape={tuple(pv.shape)}, min={pv.min().item()}, max={pv.max().item()}, mean={pv.mean().item()}, dtype={pv.dtype}"
-                    )
-        grid = qwen_input.get("image_grid_thw")
-        if grid is not None:
-            if torch.isnan(grid.float()).any():
-                nan_count = torch.isnan(grid.float()).sum().item()
-                print(f"[GROOT][DEBUG] NaNs in image_grid_thw before Qwen: count={nan_count}, shape={tuple(grid.shape)}")
-            else:
-                print(f"[GROOT][DEBUG] image_grid_thw: shape={tuple(grid.shape)}, values={grid[0].tolist() if grid.numel() else 'empty'}")
+        if pv is not None and torch.isnan(pv).any():
+            nan_count = torch.isnan(pv).sum().item()
+            print(f"[GROOT][DEBUG] NaNs in pixel_values before Qwen: count={nan_count}, shape={tuple(pv.shape)}", flush=True)
+            torch.save(vl_input, "debug_nan_input_pre.pt")
 
         # If pixel_values are flattened tokens, reshape using grid_thw
         # [REMOVED] Incorrect reshaping logic. Qwen expects flattened pixel_values.
@@ -521,7 +557,11 @@ class QwenBackbone(nn.Module):
                     f"[GROOT][DEBUG] NaNs detected in Qwen backbone output: count={nan_count}, "
                     f"shape={tuple(qwen_embeds.shape)}"
                 )
-                qwen_embeds = torch.nan_to_num(qwen_embeds, nan=0.0, posinf=0.0, neginf=0.0)
+            # CRITICAL: nan_to_num must be OUTSIDE torch.no_grad() to preserve the
+            # computation graph. If inside no_grad, the output has no grad_fn, which
+            # breaks backward() when the backbone is the only trainable path
+            # (e.g. backbone_align stage where the action head is fully frozen).
+            qwen_embeds = torch.nan_to_num(qwen_embeds, nan=0.0, posinf=0.0, neginf=0.0)
         output: dict[str, torch.Tensor | None] = {
             "backbone_features": qwen_embeds,
             "backbone_attention_mask": qwen_mask,
@@ -537,12 +577,24 @@ class QwenBackbone(nn.Module):
         self,
         vl_input: BatchFeature,
         *,
+        cot_session: "Any | None" = None,
+        dataset_meta: "dict | None" = None,
         max_new_tokens: int = 64,
         do_sample: bool = False,
         temperature: float = 0.7,
         top_p: float = 0.9,
-    ) -> list[dict[str, str | int]]:
-        """Generate CoT-like text and extract THINK/SUMMARY fields."""
+    ) -> list[dict]:
+        """Generate reasoning trace.
+
+        When cot_session + dataset_meta are provided (structured CoT mode):
+          - Rebuilds the prompt with the INIT/TICK JSON schema
+          - Parses the output as JSON
+          - Updates cot_session with the extracted plan
+          - Returns dicts with keys: raw_text, parsed_json, parse_ok, mode, cot_step, generated_tokens
+
+        When called without cot_session (legacy mode):
+          - Returns dicts with keys: raw_text, think_text, summary_text, generated_tokens
+        """
         qwen_input, _ = self._collect_prefixed_inputs(vl_input)
         if not qwen_input:
             return []
@@ -553,6 +605,15 @@ class QwenBackbone(nn.Module):
         grid = qwen_input.get("image_grid_thw")
         if grid is not None and grid.dim() == 3:
             qwen_input["image_grid_thw"] = grid.flatten(0, 1)
+
+        # Structured CoT mode: rebuild prompt with system+user message and CoT schema
+        cot_mode_active = cot_session is not None and dataset_meta is not None
+        if cot_mode_active:
+            try:
+                qwen_input = self._build_cot_qwen_input(qwen_input, cot_session=cot_session, dataset_meta=dataset_meta)
+            except Exception as exc:
+                print(f"[GROOT][CoT] _build_cot_qwen_input failed: {exc}. Falling back to legacy trace.", flush=True)
+                cot_mode_active = False
 
         input_ids = qwen_input.get("input_ids")
         if input_ids is None:
@@ -570,20 +631,17 @@ class QwenBackbone(nn.Module):
             gen_kwargs["top_p"] = float(top_p)
 
         device = input_ids.device
-        autocast_enabled = device.type == "cuda"
-        with torch.autocast(
-            device_type=device.type,
-            dtype=torch.bfloat16,
-            enabled=autocast_enabled,
-        ):
+        # On ROCm, disable BF16 autocast for generation (same ViT NaN protection as forward_qwen)
+        autocast_enabled = device.type == "cuda" and getattr(torch.version, "hip", None) is None
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast_enabled):
             generated = self.qwen_model.generate(**qwen_input, **gen_kwargs)
 
         if generated.dim() != 2:
             return []
 
         prompt_len = input_ids.shape[1]
-        traces: list[dict[str, str | int]] = []
-        for i in range(generated.shape[0]):
+        traces: list[dict] = []
+        for i in range(min(generated.shape[0], 1)):  # CoT: always process item 0 only
             continuation = generated[i, prompt_len:]
             if self._tokenizer is not None:
                 raw_text = self._tokenizer.decode(
@@ -593,20 +651,141 @@ class QwenBackbone(nn.Module):
             else:
                 raw_text = str(continuation.detach().cpu().tolist())
 
-            think_text = self._extract_tag(raw_text, "THINK") or self._extract_tag(raw_text, "REASONING")
-            summary_text = self._extract_tag(raw_text, "SUMMARY")
-            if not summary_text and self.summary_token in raw_text:
-                summary_text = raw_text.split(self.summary_token, 1)[-1].strip()
-
-            traces.append(
-                {
+            if cot_mode_active:
+                from lerobot.policies.grootCoT.cot_schema import parse_cot_json
+                parsed, parse_err = parse_cot_json(raw_text)
+                if parsed is not None:
+                    cot_session.advance(parsed)
+                else:
+                    cot_session.advance(None)  # still increment step_count
+                traces.append({
+                    "raw_text": raw_text,
+                    "parsed_json": parsed,
+                    "parse_ok": parsed is not None,
+                    "parse_error": parse_err,
+                    "mode": cot_session.mode if parsed is not None else (
+                        "INIT" if cot_session.step_count <= 1 else "TICK"
+                    ),
+                    "cot_step": cot_session.step_count,
+                    "generated_tokens": int(continuation.shape[0]),
+                })
+            else:
+                # Legacy: extract THINK/SUMMARY tags
+                think_text = self._extract_tag(raw_text, "THINK") or self._extract_tag(raw_text, "REASONING")
+                summary_text = self._extract_tag(raw_text, "SUMMARY")
+                if not summary_text and self.summary_token in raw_text:
+                    summary_text = raw_text.split(self.summary_token, 1)[-1].strip()
+                traces.append({
                     "raw_text": raw_text,
                     "think_text": think_text,
                     "summary_text": summary_text,
                     "generated_tokens": int(continuation.shape[0]),
-                }
-            )
+                })
         return traces
+
+    def _build_cot_qwen_input(
+        self,
+        qwen_input: dict,
+        *,
+        cot_session: "Any",
+        dataset_meta: dict,
+    ) -> dict:
+        """Rebuild qwen_input dict with CoT system+user prompt, keeping vision tokens intact.
+
+        Strategy:
+          1. Tokenize system message and prepend to existing input_ids.
+          2. Keep original tokens up to (and including) the last <|vision_end|> token.
+             This preserves <|im_start|>user + vision block from the training prompt.
+          3. Append the new CoT user text suffix: \n{user_msg}<|im_end|>\n<|im_start|>assistant\n
+          4. Slice pixel_values / image_grid_thw to batch item 0 only.
+        """
+        from lerobot.policies.grootCoT.cot_schema import VISION_END_ID
+
+        tok = self._tokenizer
+        if tok is None:
+            raise RuntimeError("Tokenizer unavailable for CoT prompt building.")
+
+        orig_ids = qwen_input["input_ids"]  # (B, L)
+        B = orig_ids.shape[0]
+        device = orig_ids.device
+
+        # Use batch item 0 for CoT generation
+        ids_list = orig_ids[0].cpu().tolist()
+
+        # Find last <|vision_end|> position (151653)
+        last_ve = -1
+        for idx, tok_id in enumerate(ids_list):
+            if tok_id == VISION_END_ID:
+                last_ve = idx
+        if last_ve == -1:
+            raise ValueError("No <|vision_end|> token found in input_ids — cannot rebuild CoT prompt.")
+
+        # Build system message prefix tokens
+        # Structure: <|im_start|>system\n{sys_msg}<|im_end|>\n
+        im_start_id = tok.convert_tokens_to_ids("<|im_start|>")
+        im_end_id = tok.convert_tokens_to_ids("<|im_end|>")
+
+        def _encode(text: str) -> list[int]:
+            return tok.encode(text, add_special_tokens=False)
+
+        # Newline as token ids list
+        _nl = tok.encode("\n", add_special_tokens=False)
+
+        sys_text, user_text = cot_session.get_prompts(time_index=dataset_meta.get("time_index", 0))
+
+        sys_prefix = (
+            [im_start_id]
+            + tok.encode("system\n", add_special_tokens=False)
+            + _encode(sys_text)
+            + [im_end_id]
+            + _nl
+        )
+
+        # User suffix (after vision tokens): \n{user_msg}<|im_end|>\n<|im_start|>assistant\n
+        user_suffix = (
+            _nl
+            + _encode(user_text)
+            + [im_end_id]
+            + _nl
+            + [im_start_id]
+            + tok.encode("assistant\n", add_special_tokens=False)
+        )
+
+        # Stitch: sys_prefix + ids[0 : last_ve+1] + user_suffix
+        vision_kept = ids_list[: last_ve + 1]
+        new_ids = sys_prefix + vision_kept + user_suffix
+        new_ids_tensor = torch.tensor([new_ids], dtype=torch.long, device=device)
+        new_attn_mask = torch.ones_like(new_ids_tensor)
+
+        # Build output dict: keep pixel_values and image_grid_thw for item 0 only
+        new_input: dict = {
+            "input_ids": new_ids_tensor,
+            "attention_mask": new_attn_mask,
+        }
+
+        # pixel_values: (B, n_imgs, tokens, dim) after collation regrouping
+        pv = qwen_input.get("pixel_values")
+        if pv is not None:
+            if pv.dim() == 4 and pv.shape[0] == B:
+                new_input["pixel_values"] = pv[0:1]  # (1, n_imgs, tokens, dim)
+            elif pv.dim() == 2 and B > 1 and pv.shape[0] % B == 0:
+                # Flat format: (B * tokens_per_item, dim) — slice to item 0 only
+                tokens_per_item = pv.shape[0] // B
+                new_input["pixel_values"] = pv[0:tokens_per_item]
+            else:
+                # Single item or unexpected shape — pass as-is
+                new_input["pixel_values"] = pv
+
+        # image_grid_thw: (B*n_imgs, 3) after flatten in extract_reasoning_trace
+        grid = qwen_input.get("image_grid_thw")
+        if grid is not None and grid.dim() == 2:
+            total_grids = grid.shape[0]
+            n_imgs = max(1, total_grids // B)
+            new_input["image_grid_thw"] = grid[0:n_imgs]
+        elif grid is not None:
+            new_input["image_grid_thw"] = grid
+
+        return new_input
 
 
 class EagleBackbone(nn.Module):
@@ -966,16 +1145,25 @@ class GR00TN15(PreTrainedModel):
         self,
         inputs: dict,
         *,
+        cot_session: "Any | None" = None,
+        dataset_meta: "dict | None" = None,
         max_new_tokens: int = 64,
         do_sample: bool = False,
         temperature: float = 0.7,
         top_p: float = 0.9,
-    ) -> list[dict[str, str | int]]:
-        """Generate Qwen reasoning traces from current visual-language inputs."""
+    ) -> list[dict]:
+        """Generate Qwen reasoning traces from current visual-language inputs.
+
+        When cot_session + dataset_meta are provided, generates structured JSON
+        output following the vla.plan.recap.v1 schema (INIT or TICK mode).
+        Otherwise falls back to legacy THINK/SUMMARY extraction.
+        """
         backbone_inputs = self.prepare_backbone_input(inputs)
         if hasattr(self.backbone, "extract_reasoning_trace"):
             return self.backbone.extract_reasoning_trace(
                 backbone_inputs,
+                cot_session=cot_session,
+                dataset_meta=dataset_meta,
                 max_new_tokens=max_new_tokens,
                 do_sample=do_sample,
                 temperature=temperature,
@@ -1333,18 +1521,60 @@ class GR00TN15(PreTrainedModel):
             local_model_path, config=config, local_model_path=local_model_path, **kwargs
         )
 
-        # Optional heavy safety path: re-initialize Qwen backbone after checkpoint load.
-        # Disabled by default because it doubles startup memory usage on multi-GPU launches.
+        # Detect and fix corrupted QwenBackbone weights caused by HuggingFace's
+        # init_empty_weights() context during from_pretrained. When the outer
+        # GR00T checkpoint doesn't contain Qwen3VL keys (e.g., GR00T-N1.5-3B
+        # uses eagle_model), those parameters remain as uninitialized meta tensors
+        # and get garbage values when finally materialized.
+        # Fix: in-place reload from Qwen3VL checkpoint (CPU-only, no extra GPU memory).
+        if hasattr(pretrained_model, "backbone") and isinstance(pretrained_model.backbone, QwenBackbone):
+            _backbone = pretrained_model.backbone
+            _qwen_model = _backbone.qwen_model
+            # Check ViT proj weight for corruption (should be small values ~0.01-0.1)
+            _vit = getattr(_qwen_model, "visual", None)
+            _vit_proj = getattr(getattr(_vit, "patch_embed", None), "proj", None) if _vit else None
+            if _vit_proj is not None:
+                _w_max = _vit_proj.weight.float().abs().max().item()
+                print(f"[GROOT] ViT proj weight check: max={_w_max:.4g} (expected <1.0)", flush=True)
+                if _w_max > 10.0:
+                    # Weights are uninitialized garbage — reload in-place from Qwen checkpoint
+                    _backbone_cfg = getattr(pretrained_model.config, "backbone_cfg", {})
+                    _model_id = _backbone_cfg.get("model_id", "Qwen/Qwen3-VL-8B-Instruct")
+                    print(f"[GROOT] Corrupted ViT weights detected (max={_w_max:.4g}). In-place reload from {_model_id}...", flush=True)
+                    import gc
+                    _is_rocm_fix = getattr(torch.version, "hip", None) is not None
+                    _fix_load_kw = {
+                        "trust_remote_code": True,
+                        "device_map": "cpu",
+                        "dtype": torch.float32,
+                    }
+                    _qwen_cpu = Qwen3VLForConditionalGeneration.from_pretrained(_model_id, **_fix_load_kw)
+                    _cpu_sd = _qwen_cpu.state_dict()
+                    _reloaded, _skipped = 0, 0
+                    with torch.no_grad():
+                        for _name, _param in _qwen_model.named_parameters():
+                            if _name in _cpu_sd:
+                                _src = _cpu_sd[_name].to(dtype=_param.dtype, device=_param.device)
+                                _param.data.copy_(_src)
+                                _reloaded += 1
+                            else:
+                                _skipped += 1
+                    del _qwen_cpu, _cpu_sd
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    _new_max = _vit_proj.weight.float().abs().max().item()
+                    print(f"[GROOT] In-place reload done: {_reloaded} params reloaded, {_skipped} skipped. New ViT max={_new_max:.4g}", flush=True)
+            else:
+                print("[GROOT] WARNING: Could not locate ViT patch_embed.proj for weight check.", flush=True)
+
+        # Legacy heavy safety path (kept for backward compat, now superceded by in-place fix above).
         force_backbone_reinit = os.getenv("GROOT_FORCE_BACKBONE_REINIT", "0").strip() == "1"
         if (
             force_backbone_reinit
             and hasattr(pretrained_model, "backbone")
             and isinstance(pretrained_model.backbone, QwenBackbone)
         ):
-            print("[GROOT] Re-initializing Qwen Backbone to purge potential checkpoint contamination...")
-            # Re-create backbone using the configuration
-            # Note: config.backbone_cfg is a dict
-            # Rebuild LoRA config for Qwen backbone (if any)
+            print("[GROOT] GROOT_FORCE_BACKBONE_REINIT=1: Re-creating QwenBackbone (uses 2x GPU memory)...")
             lora_cfg = getattr(pretrained_model.config, "lora_config", {})
             if not lora_cfg:
                 lora_cfg = {
@@ -1354,7 +1584,6 @@ class GR00TN15(PreTrainedModel):
                     "target_modules": getattr(pretrained_model.config, "lora_target_modules", None),
                 }
             backbone_cfg = dict(pretrained_model.config.backbone_cfg)
-            # Avoid passing lora_config twice (via backbone_cfg and explicit kwarg).
             backbone_cfg.pop("lora_config", None)
             pretrained_model.backbone = QwenBackbone(**backbone_cfg, lora_config=lora_cfg)
 

@@ -345,6 +345,154 @@ def _inject_recap_indicator_from_labels(
     )
 
 
+def _run_cot_spot_check(
+    cfg: "TrainPipelineConfig",
+    batch: dict,
+    policy: "PreTrainedPolicy",
+    step: int,
+    wandb_logger: "WandBLogger | None",
+    cot_registry: "Any | None",
+    out_dir: "Path",
+) -> "Any":
+    """Generate one structured CoT trace for the first sample of the current training batch.
+
+    This runs entirely under torch.inference_mode() and has no effect on the training loss.
+    Outputs are saved to {out_dir}/cot_traces/ as JSONL and logged to wandb.
+    Returns the (possibly updated) cot_registry.
+    """
+    import json as _json
+    from pathlib import Path as _Path
+
+    try:
+        from lerobot.policies.grootCoT.cot_schema import (
+            CoTSessionRegistry,
+            detect_dataset_family,
+        )
+    except ImportError as exc:
+        logging.warning(f"[CoT] cot_schema import failed: {exc}")
+        return cot_registry
+
+    # Lazy-init registry
+    if cot_registry is None:
+        cameras = ["head_left", "head_right", "wrist_left", "wrist_right"]
+        cot_registry = CoTSessionRegistry(
+            dataset_name=getattr(getattr(cfg, "dataset", None), "dex3_dataset", "unknown") or "unknown",
+            dataset_family=cfg.cot_generation_dataset_family,
+            time_horizon_s=cfg.cot_generation_time_horizon_s,
+            terminal_failure_cost=cfg.cot_generation_terminal_failure_cost,
+            system2_period=getattr(getattr(cfg, "policy", None), "system2_update_every_n_steps", 4) or 4,
+            cameras_present=cameras,
+        )
+
+    # Get metadata from batch (first item)
+    episode_idx = int(batch.get("episode_index", torch.zeros(1))[0].item()) if isinstance(
+        batch.get("episode_index"), torch.Tensor) else 0
+    task_str = ""
+    raw_task = batch.get("task")
+    if isinstance(raw_task, (list, tuple)) and len(raw_task) > 0:
+        task_str = str(raw_task[0])
+    elif isinstance(raw_task, str):
+        task_str = raw_task
+    if not task_str:
+        task_str = "Perform the task."
+
+    session = cot_registry.get_or_create(episode_idx, task_str)
+    cot_registry.evict_old(keep_recent=128)
+
+    # Extract CoT trace
+    policy_inner = getattr(policy, "module", policy)  # unwrap DDP if needed
+    if not hasattr(policy_inner, "extract_cot_trace"):
+        return cot_registry
+
+    dataset_meta = session.build_meta(time_index=step)
+
+    try:
+        with torch.inference_mode():
+            traces = policy_inner.extract_cot_trace(
+                batch,
+                cot_session=session,
+                dataset_meta=dataset_meta,
+                max_new_tokens=cfg.cot_generation_max_new_tokens,
+                do_sample=cfg.cot_generation_do_sample,
+                temperature=cfg.cot_generation_temperature,
+                top_p=cfg.cot_generation_top_p,
+            )
+    except Exception as exc:
+        logging.warning(f"[CoT] extract_cot_trace failed at step {step}: {exc}")
+        return cot_registry
+
+    if not traces:
+        return cot_registry
+
+    trace = traces[0]
+
+    # Save to JSONL
+    traces_dir = _Path(out_dir) / "cot_traces"
+    traces_dir.mkdir(parents=True, exist_ok=True)
+    record = {
+        "step": step,
+        "episode_index": episode_idx,
+        "task": task_str,
+        "mode": trace.get("mode", "INIT"),
+        "cot_step": trace.get("cot_step", 0),
+        "parse_ok": trace.get("parse_ok", False),
+        "parse_error": trace.get("parse_error"),
+        "generated_tokens": trace.get("generated_tokens", 0),
+        "raw_text": trace.get("raw_text", ""),
+        "parsed_json": trace.get("parsed_json"),
+    }
+    jsonl_path = traces_dir / f"step_{step:08d}.jsonl"
+    try:
+        with open(jsonl_path, "a") as fh:
+            fh.write(_json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        logging.warning(f"[CoT] Failed to write trace to {jsonl_path}: {exc}")
+
+    # Log to wandb
+    if wandb_logger is not None:
+        log_dict: dict = {
+            "cot/parse_ok": int(trace.get("parse_ok", False)),
+            "cot/generated_tokens": trace.get("generated_tokens", 0),
+            "cot/mode": 0 if trace.get("mode", "INIT") == "INIT" else 1,
+            "cot/cot_step": trace.get("cot_step", 0),
+        }
+        parsed = trace.get("parsed_json")
+        if parsed is not None:
+            progress = parsed.get("progress", {})
+            if isinstance(progress, dict):
+                log_dict["cot/phi_total"] = float(progress.get("phi_total", 0.0))
+            recap = parsed.get("recap", {})
+            if isinstance(recap, dict):
+                rl = recap.get("reward_label", {})
+                if isinstance(rl, dict):
+                    log_dict["cot/r_t"] = float(rl.get("r_t", -1.0))
+                vt = recap.get("value_target", {})
+                if isinstance(vt, dict):
+                    log_dict["cot/v_hat"] = float(vt.get("v_hat", -0.5))
+                adv = recap.get("advantage", {})
+                if isinstance(adv, dict):
+                    ind = adv.get("indicator_I", "DROPPED")
+                    log_dict["cot/indicator"] = {"POS": 1, "NEG": -1, "DROPPED": 0}.get(str(ind), 0)
+        # Log a text sample every 5 spot-checks (avoid wandb log spam)
+        if step % (cfg.cot_generation_freq_steps * 5) == 0:
+            short_text = trace.get("raw_text", "")[:500]
+            try:
+                wandb_logger.log_dict({"cot/sample_text": short_text}, step)
+            except Exception:
+                pass
+        try:
+            wandb_logger.log_dict(log_dict, step)
+        except Exception as exc:
+            logging.warning(f"[CoT] wandb log failed: {exc}")
+
+    parse_status = "OK" if trace.get("parse_ok") else f"FAIL({trace.get('parse_error', '?')})"
+    logging.info(
+        f"[CoT] step={step} episode={episode_idx} mode={trace.get('mode','?')} "
+        f"tokens={trace.get('generated_tokens',0)} parse={parse_status}"
+    )
+    return cot_registry
+
+
 def _run_joint_reconstruction_eval(
     *,
     cfg: TrainPipelineConfig,
@@ -456,8 +604,35 @@ def _run_joint_reconstruction_eval(
                         and has_method(policy, "extract_cot_trace")
                     ):
                         try:
+                            # Use structured CoT if enabled; otherwise legacy mode
+                            _jr_cot_session = None
+                            _jr_dataset_meta = None
+                            if cfg.cot_generation_enable:
+                                try:
+                                    from lerobot.policies.grootCoT.cot_schema import (
+                                        CoTSessionState, detect_dataset_family,
+                                    )
+                                    _jr_ds_family = detect_dataset_family(str(task_name))
+                                    if not hasattr(_run_joint_reconstruction_eval, "_jr_sessions"):
+                                        _run_joint_reconstruction_eval._jr_sessions = {}
+                                    _jr_ep_key = (episode_index, str(task_name))
+                                    if local_step_idx == 0 or _jr_ep_key not in _run_joint_reconstruction_eval._jr_sessions:
+                                        _run_joint_reconstruction_eval._jr_sessions[_jr_ep_key] = CoTSessionState(
+                                            episode_index=episode_index,
+                                            instruction=str(task_name),
+                                            dataset_name=str(task_name),
+                                            dataset_family=_jr_ds_family,
+                                            time_horizon_s=cfg.cot_generation_time_horizon_s,
+                                            terminal_failure_cost=cfg.cot_generation_terminal_failure_cost,
+                                        )
+                                    _jr_cot_session = _run_joint_reconstruction_eval._jr_sessions[_jr_ep_key]
+                                    _jr_dataset_meta = _jr_cot_session.build_meta(time_index=local_step_idx)
+                                except Exception as _jr_exc:
+                                    logging.warning(f"[CoT] JR session init failed: {_jr_exc}")
                             traces = policy.extract_cot_trace(
                                 processed_obs,
+                                cot_session=_jr_cot_session,
+                                dataset_meta=_jr_dataset_meta,
                                 max_new_tokens=cfg.joint_reconstruction_cot_max_new_tokens,
                                 do_sample=cfg.joint_reconstruction_cot_do_sample,
                                 temperature=cfg.joint_reconstruction_cot_temperature,
@@ -474,6 +649,10 @@ def _run_joint_reconstruction_eval(
                                         "raw_text": str(trace.get("raw_text", "")),
                                         "think_text": str(trace.get("think_text", "")),
                                         "summary_text": str(trace.get("summary_text", "")),
+                                        "parsed_json": trace.get("parsed_json"),
+                                        "parse_ok": bool(trace.get("parse_ok", False)),
+                                        "mode": str(trace.get("mode", "legacy")),
+                                        "cot_step": int(trace.get("cot_step", 0)),
                                         "generated_tokens": int(trace.get("generated_tokens", 0)),
                                     }
                                 )
@@ -648,9 +827,15 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         # Accelerate auto-detects the device based on the available hardware and ignores the policy.device setting.
         # Force the device to be CPU when policy.device is set to CPU.
         force_cpu = cfg.policy.device == "cpu"
+        # Set a 2-hour process group timeout to prevent NCCL watchdog SIGABRT during
+        # legitimate slow operations (e.g., MiOpen kernel compilation, checkpoint saves,
+        # or any rank temporarily stalling on I/O). Default 10 min is too short.
+        from accelerate.utils import InitProcessGroupKwargs
+        from datetime import timedelta
+        pg_kwargs = InitProcessGroupKwargs(timeout=timedelta(hours=2))
         accelerator = Accelerator(
             step_scheduler_with_optimizer=False,
-            kwargs_handlers=[ddp_kwargs],
+            kwargs_handlers=[ddp_kwargs, pg_kwargs],
             cpu=force_cpu,
         )
 
@@ -900,9 +1085,9 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         "dataloading_s": AverageMeter("data_s", ":.3f"),
     }
 
-    # Use effective batch size for proper epoch calculation in distributed training
+    # Use per-GPU batch size so step() correctly multiplies by num_processes
     train_tracker = MetricsTracker(
-        effective_batch_size,
+        cfg.batch_size,
         dataset.num_frames,
         dataset.num_episodes,
         train_metrics,
@@ -916,6 +1101,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         )
 
     last_joint_reconstruction_eval_step: int | None = None
+    _cot_registry: "Any | None" = None  # lazy-init CoTSessionRegistry
 
     for _ in range(step, cfg.steps):
         start_time = time.perf_counter()
@@ -974,6 +1160,26 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     )
                 wandb_logger.log_dict(wandb_log_dict, step)
             train_tracker.reset_averages()
+
+        # ── Structured CoT spot-check (rank 0 only, no effect on loss) ──────────
+        if (
+            cfg.cot_generation_enable
+            and step % cfg.cot_generation_freq_steps == 0
+        ):
+            if is_main_process:
+                _cot_registry = _run_cot_spot_check(
+                    cfg=cfg,
+                    batch=batch,
+                    policy=accelerator.unwrap_model(policy),
+                    step=step,
+                    wandb_logger=wandb_logger,
+                    cot_registry=_cot_registry,
+                    out_dir=cfg.output_dir,
+                )
+            # All ranks sync here: non-main ranks wait for rank 0 to finish CoT
+            # before proceeding. Without this, ranks 1-7 race ahead to the next
+            # AllReduce while rank 0 is in model.generate(), causing NCCL timeout.
+            accelerator.wait_for_everyone()
 
         if cfg.save_checkpoint and is_saving_step:
             if is_main_process:

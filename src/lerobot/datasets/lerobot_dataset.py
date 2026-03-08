@@ -91,10 +91,22 @@ def _is_recoverable_video_error(exc: Exception) -> bool:
         return True
     if isinstance(exc, AssertionError) and "ignore this item during training" in msg:
         return True
+    # Missing video file (deleted, failed download, etc.)
+    if isinstance(exc, FileNotFoundError):
+        return True
+    # pyav (av) decode errors — corrupted packets, invalid MP4 data, etc.
+    try:
+        import av
+        if isinstance(exc, av.FFmpegError):
+            return True
+    except ImportError:
+        pass
     if isinstance(exc, RuntimeError):
         recoverable_patterns = (
             "no more frames left to decode",  # torchcodec boundary/EOF
             "no frames decoded from video",  # pyav/video_reader empty decode
+            "invaliddataerror",              # DataLoader-wrapped av decode error
+            "invalid data found when processing input",  # avcodec_send_packet
         )
         if any(pattern in msg for pattern in recoverable_patterns):
             return True
@@ -990,14 +1002,37 @@ class LeRobotDataset(torch.utils.data.Dataset):
             self.repo_id,
             cause,
         )
-        try:
-            self.pull_from_repo(allow_patterns=[rel_video_path_str], ignore_patterns=None, force_download=True)
-        except Exception as download_exc:  # noqa: BLE001 - keep training alive on network/cache failures
+
+        # Run download in a daemon thread with a hard timeout.
+        # Without this, a slow/unresponsive HuggingFace connection blocks the
+        # DataLoader worker indefinitely, stalling the training loop and
+        # triggering the NCCL watchdog timeout (SIGABRT on all ranks).
+        _REDOWNLOAD_TIMEOUT_S = 60.0
+        _result: list[bool] = [False]
+
+        def _do_download() -> None:
+            try:
+                self.pull_from_repo(allow_patterns=[rel_video_path_str], ignore_patterns=None, force_download=True)
+                if (self.root / rel_video_path).exists():
+                    _result[0] = True
+            except Exception as download_exc:  # noqa: BLE001
+                logging.warning(
+                    "Force re-download failed for '%s' in dataset '%s': %s",
+                    rel_video_path_str,
+                    self.repo_id,
+                    download_exc,
+                )
+
+        import threading
+        t = threading.Thread(target=_do_download, daemon=True)
+        t.start()
+        t.join(timeout=_REDOWNLOAD_TIMEOUT_S)
+        if t.is_alive():
             logging.warning(
-                "Force re-download failed for '%s' in dataset '%s': %s",
+                "Re-download timed out (%.0fs) for '%s' (dataset='%s') — skipping sample.",
+                _REDOWNLOAD_TIMEOUT_S,
                 rel_video_path_str,
                 self.repo_id,
-                download_exc,
             )
             return False
 

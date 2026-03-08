@@ -137,9 +137,13 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         # Create base kwargs
         kwargs = {"strict": strict}
 
-        # Add device parameter for newer versions that support it
+        # Always load checkpoint to CPU to avoid double GPU allocation.
+        # safetensors' native CUDA/HIP allocation bypasses PyTorch's allocator,
+        # causing OOM when the model is already on GPU. With device='cpu',
+        # load_state_dict copies CPU→GPU in-place (no extra GPU memory).
+        # The outer policy.to(config.device) call handles final device placement.
         if packaging.version.parse(safetensors.__version__) >= packaging.version.parse("0.4.3"):
-            kwargs["device"] = map_location
+            kwargs["device"] = "cpu"
 
         # Load the model with appropriate kwargs
         missing_keys, unexpected_keys = load_model_as_safetensor(model, model_file, **kwargs)
