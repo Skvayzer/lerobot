@@ -96,6 +96,9 @@ class GrootConfig(PreTrainedConfig):
     # Whether to use the full model for LORA
     lora_full_model: bool = False
 
+    # Whether policy was loaded with PEFT adapters (set by factory when loading from checkpoint)
+    use_peft: bool = False
+
     # Training parameters (matching groot_finetune_script.py)
     optimizer_lr: float = 1e-4
     optimizer_betas: tuple[float, float] = (0.95, 0.999)

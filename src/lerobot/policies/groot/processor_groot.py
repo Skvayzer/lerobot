@@ -56,6 +56,7 @@ from lerobot.utils.constants import (
     POLICY_POSTPROCESSOR_DEFAULT_NAME,
     POLICY_PREPROCESSOR_DEFAULT_NAME,
 )
+from lerobot.constants import OBS_IMAGE, OBS_IMAGES, OBS_STATE
 
 # Defaults for Eagle processor locations
 DEFAULT_TOKENIZER_ASSETS_REPO = "lerobot/eagle2hg-processor-groot-n1p5"
@@ -285,6 +286,10 @@ class GrootInferStateFromObsStep(ProcessorStep):
 
         obs[OBS_STATE] = state
         return transition
+
+    def transform_features(self, features):
+        """Pass through — state is inferred dynamically at runtime."""
+        return features
 
 
 @dataclass

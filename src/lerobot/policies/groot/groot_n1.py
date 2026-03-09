@@ -82,7 +82,22 @@ class EagleBackbone(nn.Module):
             print(f"[GROOT] Warning: failed to prepare Eagle cache for backbone: {exc}")
 
         config = AutoConfig.from_pretrained(str(cache_dir), trust_remote_code=True)
-        self.eagle_model = AutoModel.from_config(config, trust_remote_code=True)
+        # Force eager attention on all sub-configs.
+        # flash_attn is not installed on this ROCm cluster, and nested sub-models
+        # (e.g. SiglipVisionModel) create themselves from their own config without
+        # forwarding the attn_implementation kwarg, so we must patch every nested
+        # config object in-place.
+        def _force_eager_attn(cfg, depth=0):
+            if cfg is None or depth > 5:
+                return
+            for attr in ("_attn_implementation", "_attn_implementation_internal"):
+                if getattr(cfg, attr, None) == "flash_attention_2":
+                    setattr(cfg, attr, "eager")
+            for name in list(vars(cfg)):
+                if name.endswith("_config"):
+                    _force_eager_attn(getattr(cfg, name, None), depth + 1)
+        _force_eager_attn(config)
+        self.eagle_model = AutoModel.from_config(config, trust_remote_code=True, attn_implementation="eager")
 
         if project_to_dim is not None:
             self.eagle_linear = torch.nn.Linear(2048, project_to_dim)
