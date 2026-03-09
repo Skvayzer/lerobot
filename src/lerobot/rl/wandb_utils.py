@@ -52,8 +52,21 @@ def _make_tag(prefix: str, value: object) -> str:
     return f"{prefix}:{short_value}~{digest}"
 
 
-def cfg_to_group(cfg: TrainPipelineConfig, return_list: bool = False) -> list[str] | str:
+def cfg_to_group(
+    cfg: TrainPipelineConfig, return_list: bool = False, truncate_tags: bool = False, max_tag_length: int = 64
+) -> list[str] | str:
     """Return a group name for logging. Optionally returns group name as list."""
+
+    def _maybe_truncate(tag: str) -> str:
+        """Truncate tag to max_tag_length characters if required.
+
+        wandb rejects tags longer than 64 characters.
+        See: https://github.com/wandb/wandb/blob/main/wandb/sdk/wandb_settings.py
+        """
+        if len(tag) <= max_tag_length:
+            return tag
+        return tag[:max_tag_length]
+
     lst = [
         _make_tag("policy", cfg.policy.type),
         _make_tag("seed", cfg.seed),
@@ -114,7 +127,7 @@ class WandBLogger:
             entity=self.cfg.entity,
             name=self.job_name,
             notes=self.cfg.notes,
-            tags=cfg_to_group(cfg, return_list=True),
+            tags=cfg_to_group(cfg, return_list=True, truncate_tags=True),
             dir=self.log_dir,
             config=cfg.to_dict(),
             # TODO(rcadene): try set to True
@@ -143,7 +156,32 @@ class WandBLogger:
         artifact_name = f"{self._group}-{step_id}"
         artifact_name = get_safe_wandb_artifact_name(artifact_name)
         artifact = self._wandb.Artifact(artifact_name, type="model")
-        artifact.add_file(checkpoint_dir / PRETRAINED_MODEL_DIR / SAFETENSORS_SINGLE_FILE)
+        pretrained_model_dir = checkpoint_dir / PRETRAINED_MODEL_DIR
+
+        # Check if this is a PEFT model (has adapter files instead of model.safetensors)
+        adapter_model_file = pretrained_model_dir / "adapter_model.safetensors"
+        standard_model_file = pretrained_model_dir / SAFETENSORS_SINGLE_FILE
+
+        if adapter_model_file.exists():
+            # PEFT model: add adapter files and configs
+            artifact.add_file(adapter_model_file)
+            adapter_config_file = pretrained_model_dir / "adapter_config.json"
+            if adapter_config_file.exists():
+                artifact.add_file(adapter_config_file)
+            # Also add the policy config which is needed for loading
+            config_file = pretrained_model_dir / "config.json"
+            if config_file.exists():
+                artifact.add_file(config_file)
+        elif standard_model_file.exists():
+            # Standard model: add the single safetensors file
+            artifact.add_file(standard_model_file)
+        else:
+            logging.warning(
+                f"No {SAFETENSORS_SINGLE_FILE} or adapter_model.safetensors found in {pretrained_model_dir}. "
+                "Skipping model artifact upload to WandB."
+            )
+            return
+
         self._wandb.log_artifact(artifact)
 
     def log_dict(

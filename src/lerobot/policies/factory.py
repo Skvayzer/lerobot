@@ -40,6 +40,7 @@ from lerobot.policies.pi05.configuration_pi05 import PI05Config
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.sac.configuration_sac import SACConfig
 from lerobot.policies.sac.reward_model.configuration_classifier import RewardClassifierConfig
+from lerobot.policies.sarm.configuration_sarm import SARMConfig
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.policies.tdmpc.configuration_tdmpc import TDMPCConfig
 try:
@@ -49,6 +50,8 @@ except ImportError:
         # Backward-compatibility for older policy utils without this helper.
         return None
 from lerobot.policies.vqbet.configuration_vqbet import VQBeTConfig
+from lerobot.policies.wall_x.configuration_wall_x import WallXConfig
+from lerobot.policies.xvla.configuration_xvla import XVLAConfig
 from lerobot.processor import PolicyAction, PolicyProcessorPipeline
 from lerobot.processor.converters import (
     batch_to_transition,
@@ -61,22 +64,6 @@ from lerobot.utils.constants import (
     POLICY_POSTPROCESSOR_DEFAULT_NAME,
     POLICY_PREPROCESSOR_DEFAULT_NAME,
 )
-
-try:
-    from lerobot.policies.sarm.configuration_sarm import SARMConfig
-except ImportError:
-    # Optional policy dependency may be absent in minimal forks.
-    SARMConfig = None  # type: ignore[assignment]
-
-try:
-    from lerobot.policies.wall_x.configuration_wall_x import WallXConfig
-except ImportError:
-    WallXConfig = None  # type: ignore[assignment]
-
-try:
-    from lerobot.policies.xvla.configuration_xvla import XVLAConfig
-except ImportError:
-    XVLAConfig = None  # type: ignore[assignment]
 
 
 def get_policy_class(name: str) -> type[PreTrainedPolicy]:
@@ -199,12 +186,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
     elif policy_type == "groot":
         return GrootConfig(**kwargs)
     elif policy_type == "xvla":
-        if XVLAConfig is None:
-            raise ValueError("Policy type 'xvla' is not available in this checkout.")
         return XVLAConfig(**kwargs)
     elif policy_type == "wall_x":
-        if WallXConfig is None:
-            raise ValueError("Policy type 'wall_x' is not available in this checkout.")
         return WallXConfig(**kwargs)
     else:
         try:
@@ -433,7 +416,7 @@ def make_pre_post_processors(
             dataset_stats=kwargs.get("dataset_stats"),
         )
 
-    elif SARMConfig is not None and isinstance(policy_cfg, SARMConfig):
+    elif isinstance(policy_cfg, SARMConfig):
         from lerobot.policies.sarm.processor_sarm import make_sarm_pre_post_processors
 
         processors = make_sarm_pre_post_processors(
@@ -449,7 +432,7 @@ def make_pre_post_processors(
             dataset_stats=kwargs.get("dataset_stats"),
         )
 
-    elif XVLAConfig is not None and isinstance(policy_cfg, XVLAConfig):
+    elif isinstance(policy_cfg, XVLAConfig):
         from lerobot.policies.xvla.processor_xvla import (
             make_xvla_pre_post_processors,
         )
@@ -459,7 +442,7 @@ def make_pre_post_processors(
             dataset_stats=kwargs.get("dataset_stats"),
         )
 
-    elif WallXConfig is not None and isinstance(policy_cfg, WallXConfig):
+    elif isinstance(policy_cfg, WallXConfig):
         from lerobot.policies.wall_x.processor_wall_x import make_wall_x_pre_post_processors
 
         processors = make_wall_x_pre_post_processors(

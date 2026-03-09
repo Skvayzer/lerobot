@@ -439,6 +439,14 @@ def load_subtasks(local_dir: Path) -> pandas.DataFrame | None:
     return None
 
 
+def load_subtasks(local_dir: Path) -> pandas.DataFrame | None:
+    """Load subtasks from subtasks.parquet if it exists."""
+    subtasks_path = local_dir / DEFAULT_SUBTASKS_PATH
+    if subtasks_path.exists():
+        return pd.read_parquet(subtasks_path)
+    return None
+
+
 def write_episodes(episodes: Dataset, local_dir: Path) -> None:
     """Write episode metadata to a parquet file in the LeRobot v3.0 format.
     This function writes episode-level metadata to a single parquet file.
