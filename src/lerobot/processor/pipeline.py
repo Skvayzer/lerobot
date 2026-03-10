@@ -780,6 +780,14 @@ class DataProcessorPipeline(HubMixin, Generic[TInput, TOutput]):
             # 3. Load step state if available
             cls._load_step_state(step_instance, step_entry, model_id, base_path, hub_download_kwargs)
 
+            # 3b. Re-apply any "stats" override AFTER state loading. _load_step_state can call
+            # load_state_dict which overwrites self.stats with checkpoint/base-model values, silently
+            # discarding the dataset stats passed by the caller. Re-applying here ensures the
+            # caller-provided stats (e.g. from the current dataset) always take priority.
+            step_overrides_kw = overrides.get(step_key, {})
+            if step_overrides_kw.get("stats") is not None and hasattr(step_instance, "stats"):
+                step_instance.stats = step_overrides_kw["stats"]
+
             # 4. Track used overrides
             if step_key in override_keys:
                 override_keys.discard(step_key)
