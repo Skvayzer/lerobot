@@ -67,18 +67,32 @@ def _load_gr00t_n1d6(base_model_path: str, use_flash_attention: bool) -> "Gr00tN
     if use_flash_attention:
         return Gr00tN1d6.from_pretrained(base_model_path, trust_remote_code=True)
 
-    # ROCm path: load internal config and override use_flash_attention to False.
-    # gr00t_n1d6.py passes config.use_flash_attention to EagleBackbone.__init__,
-    # which (after our eagle_backbone.py patch) sets eager attention on the Eagle config.
+    # ROCm path: flash_attn not installed. Patch transformers' flash-attn check
+    # to be a no-op so eager attention is used instead.
+    import transformers.modeling_utils as _tmu
+    _orig_can_dispatch = _tmu.PreTrainedModel._flash_attn_2_can_dispatch
+
+    def _skip_flash_check(self, *args, **kwargs):
+        """No-op: ROCm uses eager attention instead of flash_attention_2."""
+        pass
+
+    _tmu.PreTrainedModel._flash_attn_2_can_dispatch = _skip_flash_check
+
+    # Load internal config and override use_flash_attention to False so
+    # eagle_backbone.py's eager-attn patch triggers correctly.
     from gr00t.configs.model.gr00t_n1d6 import Gr00tN1d6Config as _Gr00tInternalCfg
     internal_cfg = _Gr00tInternalCfg.from_pretrained(base_model_path)
     internal_cfg.use_flash_attention = False
 
-    model = Gr00tN1d6.from_pretrained(
-        base_model_path,
-        config=internal_cfg,
-        trust_remote_code=True,
-    )
+    try:
+        model = Gr00tN1d6.from_pretrained(
+            base_model_path,
+            config=internal_cfg,
+            trust_remote_code=True,
+        )
+    finally:
+        _tmu.PreTrainedModel._flash_attn_2_can_dispatch = _orig_can_dispatch
+
     # Belt-and-suspenders: ensure eager attention on backbone config
     _force_eager_attn(model.backbone.model.config)
     return model
