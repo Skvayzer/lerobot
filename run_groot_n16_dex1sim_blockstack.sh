@@ -1,12 +1,12 @@
 #!/bin/bash
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gres=gpu:8
-#SBATCH --cpus-per-task=64
+#SBATCH --gres=gpu:4
+#SBATCH --cpus-per-task=32
 #SBATCH --time=3-00:00:00
 #SBATCH --partition=faculty
 #SBATCH --qos=gtqos
-#SBATCH --mem=512G
+#SBATCH --mem=256G
 #SBATCH --job-name=groot_n16_dex1sim
 #SBATCH --output=/vast/users/chenyuan.chen/constantine/unitree_IL_lerobot/unitree_lerobot/lerobot/slurm_groot_n16_dex1sim_%j.log
 #SBATCH --error=/vast/users/chenyuan.chen/constantine/unitree_IL_lerobot/unitree_lerobot/lerobot/slurm_groot_n16_dex1sim_%j.log
@@ -79,7 +79,7 @@ print('GR00T N1.6 download complete')
 OUTPUT_DIR=outputs/train/$(date +%Y%m%d_%H%M%S)_groot_n16_dex1sim_blockstack
 
 accelerate launch \
-  --multi_gpu --num_processes="$NUM_GPUS" --num_machines=1 --mixed_precision=no \
+  --multi_gpu --num_processes=4 --num_machines=1 --mixed_precision=no \
   src/lerobot/scripts/lerobot_train.py \
   --output_dir="$OUTPUT_DIR" \
   --policy.type=groot_n16 \
