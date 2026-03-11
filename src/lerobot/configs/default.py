@@ -64,7 +64,7 @@ class DatasetConfig:
     # - comma-separated aliases/repo IDs, e.g. "block_stacking,pouring,pick_bottle"
     # If provided, it overrides `repo_id`.
     dex3_dataset: str | None = None
-    # Root directory where the dataset will be stored (e.g. 'dataset/path').
+    # Root directory where the dataset will be stored (e.g. 'dataset/path'). If None, defaults to $HF_LEROBOT_HOME/repo_id.
     root: str | None = None
     # Optional local Humanoid-Everyday zip inputs.
     # If set, dataset loading will use these zip files directly instead of Hugging Face parquet files.

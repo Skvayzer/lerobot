@@ -22,7 +22,7 @@ from collections import deque
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 from pprint import pformat
-from typing import Any, Generic, TypeVar
+from typing import Any
 
 import datasets
 import numpy as np
@@ -78,8 +78,6 @@ DEFAULT_FEATURES = {
     "index": {"dtype": "int64", "shape": (1,), "names": None},
     "task_index": {"dtype": "int64", "shape": (1,), "names": None},
 }
-
-T = TypeVar("T")
 
 
 def get_parquet_file_size_in_mb(parquet_path: str | Path) -> float:
@@ -401,7 +399,9 @@ def write_tasks(tasks: pandas.DataFrame, local_dir: Path) -> None:
 def load_tasks(local_dir: Path) -> pandas.DataFrame:
     default_path = local_dir / DEFAULT_TASKS_PATH
     if default_path.exists():
-        return pd.read_parquet(default_path)
+        tasks = pd.read_parquet(default_path)
+        tasks.index.name = "task"
+        return tasks
 
     # Backward compatibility: legacy datasets may store tasks in JSONL.
     legacy_candidates = [
@@ -429,14 +429,6 @@ def load_tasks(local_dir: Path) -> pandas.DataFrame:
     raise FileNotFoundError(
         f"Could not find tasks metadata at '{default_path}' or legacy JSONL paths."
     )
-
-
-def load_subtasks(local_dir: Path) -> pandas.DataFrame | None:
-    """Load subtasks from subtasks.parquet if it exists."""
-    subtasks_path = local_dir / DEFAULT_SUBTASKS_PATH
-    if subtasks_path.exists():
-        return pd.read_parquet(subtasks_path)
-    return None
 
 
 def load_subtasks(local_dir: Path) -> pandas.DataFrame | None:
@@ -1383,7 +1375,7 @@ class LookAheadError(Exception):
     pass
 
 
-class Backtrackable(Generic[T]):
+class Backtrackable[T]:
     """
     Wrap any iterator/iterable so you can step back up to `history` items
     and look ahead up to `lookahead` items.
