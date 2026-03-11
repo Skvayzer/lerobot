@@ -35,8 +35,8 @@ export HF_HUB_ENABLE_HF_TRANSFER=0
 # Install gr00t package into training env if not already installed
 echo "Checking gr00t package installation..."
 if ! python -c "import gr00t" 2>/dev/null; then
-    echo "Installing gr00t package from /home/cosmos/Isaac-GR00T ..."
-    pip install -e /home/cosmos/Isaac-GR00T
+    echo "Installing gr00t package from /vast/users/chenyuan.chen/Isaac-GR00T ..."
+    pip install -e /vast/users/chenyuan.chen/Isaac-GR00T
     echo "gr00t installed."
 else
     echo "gr00t already installed: $(python -c 'import gr00t; print(gr00t.__version__)')"
