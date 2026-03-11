@@ -150,6 +150,104 @@ for PROC_PATH in PROC_PATHS:
         print(f"VideoInput already patched: {PROC_PATH}")
     else:
         print(f"WARN: VideoInput pattern not found in {PROC_PATH}")
+
+# Patch image_processing_eagle3_vl_fast.py:
+# 1. BASE_IMAGE_PROCESSOR_FAST_DOCSTRING* not in transformers 4.57.6 → empty string stubs
+# 2. VideoInput and make_batched_videos not in transformers.image_utils 4.57.6 → fallbacks
+IMG_FAST_OLD_FAST = (
+    "from transformers.image_processing_utils_fast import (\n"
+    "    BASE_IMAGE_PROCESSOR_FAST_DOCSTRING,\n"
+    "    BASE_IMAGE_PROCESSOR_FAST_DOCSTRING_PREPROCESS,\n"
+    "    BaseImageProcessorFast,\n"
+    "    DefaultFastImageProcessorKwargs,\n"
+    "    divide_to_patches,\n"
+    "    group_images_by_shape,\n"
+    "    reorder_images,\n"
+    ")"
+)
+IMG_FAST_NEW_FAST = (
+    "from transformers.image_processing_utils_fast import (\n"
+    "    BaseImageProcessorFast,\n"
+    "    DefaultFastImageProcessorKwargs,\n"
+    "    divide_to_patches,\n"
+    "    group_images_by_shape,\n"
+    "    reorder_images,\n"
+    ")\n"
+    "try:\n"
+    "    from transformers.image_processing_utils_fast import (\n"
+    "        BASE_IMAGE_PROCESSOR_FAST_DOCSTRING,\n"
+    "        BASE_IMAGE_PROCESSOR_FAST_DOCSTRING_PREPROCESS,\n"
+    "    )\n"
+    "except ImportError:\n"
+    "    BASE_IMAGE_PROCESSOR_FAST_DOCSTRING = ''  # compat stub\n"
+    "    BASE_IMAGE_PROCESSOR_FAST_DOCSTRING_PREPROCESS = ''  # compat stub"
+)
+IMG_FAST_OLD_UTILS = (
+    "from transformers.image_utils import (\n"
+    "    OPENAI_CLIP_MEAN,\n"
+    "    OPENAI_CLIP_STD,\n"
+    "    IMAGENET_STANDARD_MEAN,  # 0.5, 0.5, 0.5\n"
+    "    IMAGENET_STANDARD_STD,  # 0.5, 0.5, 0.5\n"
+    "    ChannelDimension,\n"
+    "    ImageInput,\n"
+    "    VideoInput,\n"
+    "    PILImageResampling,\n"
+    "    SizeDict,\n"
+    "    get_image_size,\n"
+    "    make_flat_list_of_images,\n"
+    "    make_batched_videos,\n"
+    "    validate_kwargs,\n"
+    ")"
+)
+IMG_FAST_NEW_UTILS = (
+    "from transformers.image_utils import (\n"
+    "    OPENAI_CLIP_MEAN,\n"
+    "    OPENAI_CLIP_STD,\n"
+    "    IMAGENET_STANDARD_MEAN,  # 0.5, 0.5, 0.5\n"
+    "    IMAGENET_STANDARD_STD,  # 0.5, 0.5, 0.5\n"
+    "    ChannelDimension,\n"
+    "    ImageInput,\n"
+    "    PILImageResampling,\n"
+    "    SizeDict,\n"
+    "    get_image_size,\n"
+    "    make_flat_list_of_images,\n"
+    "    validate_kwargs,\n"
+    ")\n"
+    "try:\n"
+    "    from transformers.image_utils import VideoInput\n"
+    "except ImportError:\n"
+    "    VideoInput = ImageInput  # compat\n"
+    "try:\n"
+    "    from transformers.image_utils import make_batched_videos\n"
+    "except ImportError:\n"
+    "    def make_batched_videos(videos):  # compat stub\n"
+    "        return [videos] if not isinstance(videos, list) else videos"
+)
+IMG_FAST_PATHS = [
+    os.environ.get("GROOT_MODULES_DIR", "/vast/users/chenyuan.chen/Isaac-GR00T/gr00t/model/modules")
+    + "/nvidia/Eagle-Block2A-2B-v2/image_processing_eagle3_vl_fast.py",
+    os.environ.get("HF_EAGLE_CACHE", "/vast/users/chenyuan.chen/.cache/huggingface/modules/transformers_modules/Eagle_hyphen_Block2A_hyphen_2B_hyphen_v2")
+    + "/image_processing_eagle3_vl_fast.py",
+]
+for fpath in IMG_FAST_PATHS:
+    if not os.path.exists(fpath):
+        print(f"SKIP (not found): {fpath}")
+        continue
+    with open(fpath) as f:
+        content = f.read()
+    changed = False
+    if IMG_FAST_OLD_FAST in content:
+        content = content.replace(IMG_FAST_OLD_FAST, IMG_FAST_NEW_FAST)
+        changed = True
+    if IMG_FAST_OLD_UTILS in content:
+        content = content.replace(IMG_FAST_OLD_UTILS, IMG_FAST_NEW_UTILS)
+        changed = True
+    if changed:
+        with open(fpath, "w") as f:
+            f.write(content)
+        print(f"Patched image_processing_eagle3_vl_fast.py: {fpath}")
+    else:
+        print(f"Already patched or no match: {os.path.basename(fpath)}")
 PYEOF
 export GROOT_MODULES_DIR HF_EAGLE_CACHE
 
