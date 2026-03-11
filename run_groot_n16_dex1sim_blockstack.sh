@@ -104,6 +104,52 @@ for path in TARGETS:
         with open(path, "w") as f:
             f.write(patched)
         print(f"Patched Eagle3_VL assertions: {path}")
+
+# Patch processing_eagle3_vl.py: VideoInput not in transformers 4.57.6, add fallback.
+# Patch both the Isaac-GR00T source AND the HF cache so HF rebuilds the cache correctly.
+VIDEO_INPUT_OLD = (
+    "from transformers.image_utils import (\n"
+    "    ImageInput,\n"
+    "    VideoInput,\n"
+    "    get_image_size,\n"
+    "    to_numpy_array,\n"
+    ")"
+)
+VIDEO_INPUT_NEW = (
+    "from transformers.image_utils import (\n"
+    "    ImageInput,\n"
+    "    get_image_size,\n"
+    "    to_numpy_array,\n"
+    ")\n"
+    "try:\n"
+    "    from transformers.image_utils import VideoInput\n"
+    "except ImportError:\n"
+    "    VideoInput = ImageInput  # transformers compat fallback"
+)
+PROC_PATHS = [
+    os.environ.get(
+        "GROOT_MODULES_DIR",
+        "/vast/users/chenyuan.chen/Isaac-GR00T/gr00t/model/modules"
+    ) + "/nvidia/Eagle-Block2A-2B-v2/processing_eagle3_vl.py",
+    os.environ.get(
+        "HF_EAGLE_CACHE",
+        "/vast/users/chenyuan.chen/.cache/huggingface/modules/transformers_modules/Eagle_hyphen_Block2A_hyphen_2B_hyphen_v2"
+    ) + "/processing_eagle3_vl.py",
+]
+for PROC_PATH in PROC_PATHS:
+    if not os.path.exists(PROC_PATH):
+        print(f"SKIP (not found): {PROC_PATH}")
+        continue
+    with open(PROC_PATH) as f:
+        content = f.read()
+    if VIDEO_INPUT_OLD in content:
+        with open(PROC_PATH, "w") as f:
+            f.write(content.replace(VIDEO_INPUT_OLD, VIDEO_INPUT_NEW))
+        print(f"Patched VideoInput import: {PROC_PATH}")
+    elif "VideoInput = ImageInput" in content:
+        print(f"VideoInput already patched: {PROC_PATH}")
+    else:
+        print(f"WARN: VideoInput pattern not found in {PROC_PATH}")
 PYEOF
 export GROOT_MODULES_DIR HF_EAGLE_CACHE
 
