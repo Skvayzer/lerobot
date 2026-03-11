@@ -79,10 +79,10 @@ def _load_gr00t_n1d6(base_model_path: str, use_flash_attention: bool) -> "Gr00tN
     def _skip_flash_check(self, *args, **kwargs):
         pass  # no-op: skip flash_attn availability check
 
-    def _safe_check(self, attn_implementation):
+    def _safe_check(self, attn_implementation, **kwargs):
         if attn_implementation == "flash_attention_2":
             return "eager"  # fall back to eager on ROCm
-        return _orig_check(self, attn_implementation)
+        return _orig_check(self, attn_implementation, **kwargs)
 
     def _safe_lazy_import(implementation, force_import=False):
         if implementation == "flash_attention_2":
