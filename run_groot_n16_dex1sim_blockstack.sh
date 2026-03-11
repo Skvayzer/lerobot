@@ -32,11 +32,30 @@ export TOKENIZERS_PARALLELISM=false
 export HF_HUB_DISABLE_XET=1
 export HF_HUB_ENABLE_HF_TRANSFER=0
 
-# Install gr00t package into training env if not already installed
+# Install gr00t package into training env if not already installed.
+# Use --no-deps to avoid pulling in gr00t's pinned torch==2.7.1 (CUDA)
+# which would overwrite the ROCm PyTorch already in this environment.
 echo "Checking gr00t package installation..."
 if ! python -c "import gr00t" 2>/dev/null; then
-    echo "Installing gr00t package from /vast/users/chenyuan.chen/Isaac-GR00T ..."
-    pip install -e /vast/users/chenyuan.chen/Isaac-GR00T
+    echo "Installing gr00t package (--no-deps) from /vast/users/chenyuan.chen/Isaac-GR00T ..."
+    pip install --no-deps -e /vast/users/chenyuan.chen/Isaac-GR00T
+    # Install gr00t's non-torch runtime deps that may be missing
+    pip install \
+        diffusers==0.35.1 \
+        peft==0.17.1 \
+        einops==0.8.1 \
+        gymnasium==1.2.2 \
+        omegaconf==2.3.0 \
+        lmdb==1.7.5 \
+        msgpack==1.1.0 \
+        "msgpack-numpy==0.4.8" \
+        "albumentations==1.4.18" \
+        "dm-tree==0.1.8" \
+        termcolor==3.2.0 \
+        "tyro==0.9.17" \
+        "gitpython==3.1.46" \
+        "pyzmq==27.0.1" \
+        2>&1 | grep -v "^Requirement already"
     echo "gr00t installed."
 else
     echo "gr00t already installed: $(python -c 'import gr00t; print(gr00t.__version__)')"
