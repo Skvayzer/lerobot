@@ -67,16 +67,31 @@ def _load_gr00t_n1d6(base_model_path: str, use_flash_attention: bool) -> "Gr00tN
     if use_flash_attention:
         return Gr00tN1d6.from_pretrained(base_model_path, trust_remote_code=True)
 
-    # ROCm path: flash_attn not installed. Patch transformers' flash-attn check
-    # to be a no-op so eager attention is used instead.
+    # ROCm path: flash_attn is not installed. Patch transformers flash-attn
+    # validation to fall back to eager attention instead of raising.
     import transformers.modeling_utils as _tmu
+    import transformers.modeling_flash_attention_utils as _tfa
+
     _orig_can_dispatch = _tmu.PreTrainedModel._flash_attn_2_can_dispatch
+    _orig_check = _tmu.PreTrainedModel._check_and_adjust_attn_implementation
+    _orig_lazy_import = _tfa.lazy_import_flash_attention
 
     def _skip_flash_check(self, *args, **kwargs):
-        """No-op: ROCm uses eager attention instead of flash_attention_2."""
-        pass
+        pass  # no-op: skip flash_attn availability check
+
+    def _safe_check(self, attn_implementation):
+        if attn_implementation == "flash_attention_2":
+            return "eager"  # fall back to eager on ROCm
+        return _orig_check(self, attn_implementation)
+
+    def _safe_lazy_import(implementation, force_import=False):
+        if implementation == "flash_attention_2":
+            return (None, None, None, None)  # not needed for eager path
+        return _orig_lazy_import(implementation, force_import)
 
     _tmu.PreTrainedModel._flash_attn_2_can_dispatch = _skip_flash_check
+    _tmu.PreTrainedModel._check_and_adjust_attn_implementation = _safe_check
+    _tfa.lazy_import_flash_attention = _safe_lazy_import
 
     # Load internal config and override use_flash_attention to False so
     # eagle_backbone.py's eager-attn patch triggers correctly.
@@ -92,6 +107,8 @@ def _load_gr00t_n1d6(base_model_path: str, use_flash_attention: bool) -> "Gr00tN
         )
     finally:
         _tmu.PreTrainedModel._flash_attn_2_can_dispatch = _orig_can_dispatch
+        _tmu.PreTrainedModel._check_and_adjust_attn_implementation = _orig_check
+        _tfa.lazy_import_flash_attention = _orig_lazy_import
 
     # Belt-and-suspenders: ensure eager attention on backbone config
     _force_eager_attn(model.backbone.model.config)
