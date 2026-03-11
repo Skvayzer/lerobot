@@ -58,29 +58,28 @@ def _force_eager_attn(cfg, depth: int = 0) -> None:
 def _load_gr00t_n1d6(base_model_path: str, use_flash_attention: bool) -> "Gr00tN1d6":
     """Load Gr00tN1d6 model with ROCm-compatible attention.
 
-    The N1.6 EagleBackbone has a hard assertion: assert use_flash_attention.
-    Strategy: temporarily monkey-patch EagleBackbone to skip the assertion and
-    force eager attention on the loaded model config.
+    ROCm strategy: override the pretrained model's use_flash_attention=True
+    to False in the internal config before loading. The patched eagle_backbone.py
+    then sets eager attention on the Eagle config before AutoModel.from_config().
     """
-    import gr00t.model.modules.eagle_backbone as _eagle_module
     from gr00t.model.gr00t_n1d6.gr00t_n1d6 import Gr00tN1d6
 
     if use_flash_attention:
-        # No patching needed, use flash attention as-is
-        return Gr00tN1d6.from_pretrained(
-            base_model_path,
-            trust_remote_code=True,
-        )
+        return Gr00tN1d6.from_pretrained(base_model_path, trust_remote_code=True)
 
-    # ROCm path: eagle_backbone.py has been patched to accept use_flash_attention=False
-    # and set eager attention on the config before AutoModel.from_config().
-    # We load directly with no extra monkey-patching needed.
+    # ROCm path: load internal config and override use_flash_attention to False.
+    # gr00t_n1d6.py passes config.use_flash_attention to EagleBackbone.__init__,
+    # which (after our eagle_backbone.py patch) sets eager attention on the Eagle config.
+    from gr00t.configs.model.gr00t_n1d6 import Gr00tN1d6Config as _Gr00tInternalCfg
+    internal_cfg = _Gr00tInternalCfg.from_pretrained(base_model_path)
+    internal_cfg.use_flash_attention = False
+
     model = Gr00tN1d6.from_pretrained(
         base_model_path,
+        config=internal_cfg,
         trust_remote_code=True,
     )
-
-    # Belt-and-suspenders: patch backbone config again after loading
+    # Belt-and-suspenders: ensure eager attention on backbone config
     _force_eager_attn(model.backbone.model.config)
     return model
 
