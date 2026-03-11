@@ -61,6 +61,18 @@ else
     echo "gr00t already installed: $(python -c 'import gr00t; print(gr00t.__version__)')"
 fi
 
+# gr00t requires transformers==4.51.3; the training env may have a newer version.
+# Eagle3_VL's custom code uses APIs that were renamed/removed in 4.57+.
+# Install the pinned version without touching torch.
+CURRENT_TRANSFORMERS=$(python -c "import transformers; print(transformers.__version__)" 2>/dev/null)
+if [ "$CURRENT_TRANSFORMERS" != "4.51.3" ]; then
+    echo "Installing transformers==4.51.3 (current: $CURRENT_TRANSFORMERS, gr00t requires 4.51.3) ..."
+    pip install 'transformers==4.51.3' 2>&1 | grep -v "^Requirement already" | tail -5
+    echo "transformers pinned to 4.51.3"
+else
+    echo "transformers already at 4.51.3"
+fi
+
 # Patch Eagle3_VL model for ROCm: relax hard flash_attention_2 assertions so
 # eager attention (our ROCm fallback) is accepted for Qwen2/Qwen3 language models.
 # This must run before the training script imports gr00t.
@@ -98,6 +110,12 @@ for path in TARGETS:
     with open(path) as f:
         content = f.read()
     patched = ASSERT_PATTERN.sub(ASSERT_REPLACEMENT, content)
+    # Also change hard-coded flash_attention_2 for siglip vision models to "eager"
+    # so the vision encoder doesn't require flash_attn on ROCm.
+    patched = patched.replace(
+        'config.vision_config._attn_implementation = "flash_attention_2"',
+        'config.vision_config._attn_implementation = "eager"',
+    )
     if patched == content:
         print(f"Already patched or no match: {path}")
     else:
