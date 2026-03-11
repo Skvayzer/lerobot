@@ -90,7 +90,27 @@ class GrootPolicy(PreTrainedPolicy):
         model.compute_dtype = "bfloat16" if self.config.use_bf16 else model.compute_dtype
         model.config.compute_dtype = model.compute_dtype
 
+        if self.config.lora_rank > 0:
+            self._apply_lora_to_backbone(model)
+
         return model
+
+    def _apply_lora_to_backbone(self, model) -> None:
+        """Apply LoRA adapters to backbone LLM for parameter-efficient fine-tuning."""
+        from peft import LoraConfig, get_peft_model
+
+        lora_config = LoraConfig(
+            r=self.config.lora_rank,
+            lora_alpha=self.config.lora_alpha,
+            lora_dropout=self.config.lora_dropout,
+            bias="none",
+            target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
+        )
+        backbone_llm = model.backbone.eagle_model.language_model
+        lora_llm = get_peft_model(backbone_llm, lora_config)
+        model.backbone.eagle_model.language_model = lora_llm
+        lora_llm.print_trainable_parameters()
+        print(f"[GROOT] LoRA applied to backbone LLM (rank={self.config.lora_rank}, alpha={self.config.lora_alpha})")
 
     def reset(self):
         """Reset policy state when environment resets."""

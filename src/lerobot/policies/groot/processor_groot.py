@@ -290,6 +290,10 @@ class GrootInferStateFromObsStep(ProcessorStep):
         obs[OBS_STATE] = state
         return transition
 
+    def transform_features(self, features):
+        """Pass through — state is inferred dynamically at runtime."""
+        return features
+
 
 @dataclass
 @ProcessorStepRegistry.register(name="groot_pack_inputs_v3")
