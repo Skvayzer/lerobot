@@ -82,34 +82,47 @@ def _load_gr00t_n1d6(base_model_path: str, use_flash_attention: bool) -> "Gr00tN
         _saved["is_flash_attn_2_available"] = _tfa.is_flash_attn_2_available
         _tfa.is_flash_attn_2_available = lambda: False
 
-    # Patch each PreTrainedModel flash-attn guard method that exists.
-    def _make_eager_redirect(orig):
-        """Return a wrapper that redirects flash_attention_2 → eager."""
-        def _patched(self, attn_implementation=None, **kwargs):
+    # transformers 4.51: _autoset_attn_implementation is a classmethod that
+    # accepts use_flash_attention_2=True/False. Wrap it to always pass False.
+    if hasattr(_tmu.PreTrainedModel, "_autoset_attn_implementation"):
+        _orig_autoset = _tmu.PreTrainedModel._autoset_attn_implementation.__func__
+        _saved["_autoset_attn_implementation"] = _orig_autoset
+
+        def _patched_autoset(cls, config, use_flash_attention_2=False, **kwargs):
+            return _orig_autoset(cls, config, use_flash_attention_2=False, **kwargs)
+
+        _tmu.PreTrainedModel._autoset_attn_implementation = classmethod(_patched_autoset)
+
+    # transformers 4.51: disable the flash-attn enable check entirely.
+    if hasattr(_tmu.PreTrainedModel, "_check_and_enable_flash_attn_2"):
+        _saved["_check_and_enable_flash_attn_2"] = _tmu.PreTrainedModel._check_and_enable_flash_attn_2.__func__
+
+        def _patched_check_enable(cls, config, *a, **kw):
+            return config  # no-op: never enable flash_attn_2
+
+        _tmu.PreTrainedModel._check_and_enable_flash_attn_2 = classmethod(_patched_check_enable)
+
+    # transformers 4.57+: redirect flash_attention_2 → eager in the implementation check.
+    if hasattr(_tmu.PreTrainedModel, "_check_and_adjust_attn_implementation"):
+        _orig_check = _tmu.PreTrainedModel._check_and_adjust_attn_implementation
+        _saved["_check_and_adjust_attn_implementation"] = _orig_check
+
+        def _safe_check(self, attn_implementation, **kwargs):
             if attn_implementation == "flash_attention_2":
-                attn_implementation = "eager"
-            if orig is None:
-                return attn_implementation
-            return orig(self, attn_implementation, **kwargs)
-        return _patched
+                return "eager"
+            return _orig_check(self, attn_implementation, **kwargs)
 
-    for attr in (
-        "_check_and_adjust_attn_implementation",  # transformers 4.57+
-        "_autoset_attn_implementation",            # transformers 4.51
-    ):
-        if hasattr(_tmu.PreTrainedModel, attr):
-            _saved[attr] = getattr(_tmu.PreTrainedModel, attr)
-            setattr(_tmu.PreTrainedModel, attr, _make_eager_redirect(_saved[attr]))
+        _tmu.PreTrainedModel._check_and_adjust_attn_implementation = _safe_check
 
-    # Disable flash_attn_2 dispatch guard (transformers 4.57+).
+    # transformers 4.57+: no-op the flash_attn_2 dispatch guard.
     if hasattr(_tmu.PreTrainedModel, "_flash_attn_2_can_dispatch"):
         _saved["_flash_attn_2_can_dispatch"] = _tmu.PreTrainedModel._flash_attn_2_can_dispatch
         _tmu.PreTrainedModel._flash_attn_2_can_dispatch = lambda self, *a, **kw: None
 
-    # Block flash_attn lazy import (transformers 4.57+).
+    # transformers 4.57+: block flash_attn lazy import.
     if hasattr(_tfa, "lazy_import_flash_attention"):
-        _saved["lazy_import_flash_attention"] = _tfa.lazy_import_flash_attention
         _orig_lazy = _tfa.lazy_import_flash_attention
+        _saved["lazy_import_flash_attention"] = _orig_lazy
 
         def _safe_lazy(implementation, force_import=False):
             if implementation == "flash_attention_2":
@@ -117,13 +130,6 @@ def _load_gr00t_n1d6(base_model_path: str, use_flash_attention: bool) -> "Gr00tN
             return _orig_lazy(implementation, force_import)
 
         _tfa.lazy_import_flash_attention = _safe_lazy
-
-    # Also disable the 4.51-style flash-attn enable check.
-    if hasattr(_tmu.PreTrainedModel, "_check_and_enable_flash_attn_2"):
-        _saved["_check_and_enable_flash_attn_2"] = _tmu.PreTrainedModel._check_and_enable_flash_attn_2
-        _tmu.PreTrainedModel._check_and_enable_flash_attn_2 = classmethod(
-            lambda cls, config, *a, **kw: config
-        )
 
     # Load internal config and override use_flash_attention to False so
     # eagle_backbone.py's eager-attn patch triggers correctly.
@@ -138,10 +144,14 @@ def _load_gr00t_n1d6(base_model_path: str, use_flash_attention: bool) -> "Gr00tN
             trust_remote_code=True,
         )
     finally:
-        # Restore all patched methods.
+        # Restore all patched attributes.
+        _classmethod_attrs = {"_autoset_attn_implementation", "_check_and_enable_flash_attn_2"}
+        _tfa_attrs = {"is_flash_attn_2_available", "lazy_import_flash_attention"}
         for attr, orig in _saved.items():
-            if attr in ("is_flash_attn_2_available", "lazy_import_flash_attention"):
+            if attr in _tfa_attrs:
                 setattr(_tfa, attr, orig)
+            elif attr in _classmethod_attrs:
+                setattr(_tmu.PreTrainedModel, attr, classmethod(orig))
             else:
                 setattr(_tmu.PreTrainedModel, attr, orig)
 
