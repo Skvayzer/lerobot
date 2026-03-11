@@ -72,6 +72,7 @@ from lerobot.datasets.utils import (
     write_tasks,
 )
 from lerobot.datasets.video_utils import (
+    FrameTimestampError,
     StreamingVideoEncoder,
     VideoFrame,
     concatenate_video_files,
@@ -87,6 +88,35 @@ from lerobot.utils.constants import HF_LEROBOT_HOME
 CODEBASE_VERSION = "v3.0"
 
 
+def _is_recoverable_video_error(exc: Exception) -> bool:
+    """Return True for known per-sample video decode issues that should be skipped."""
+    msg = str(exc).lower()
+    if isinstance(exc, FrameTimestampError):
+        return True
+    if isinstance(exc, AssertionError) and "ignore this item during training" in msg:
+        return True
+    # Missing video file (deleted, failed download, etc.)
+    if isinstance(exc, FileNotFoundError):
+        return True
+    # pyav (av) decode errors — corrupted packets, invalid MP4 data, etc.
+    try:
+        import av
+        if isinstance(exc, av.FFmpegError):
+            return True
+    except ImportError:
+        pass
+    if isinstance(exc, RuntimeError):
+        recoverable_patterns = (
+            "no more frames left to decode",  # torchcodec boundary/EOF
+            "no frames decoded from video",  # pyav/video_reader empty decode
+            "invaliddataerror",              # DataLoader-wrapped av decode error
+            "invalid data found when processing input",  # avcodec_send_packet
+        )
+        if any(pattern in msg for pattern in recoverable_patterns):
+            return True
+    return False
+
+
 def _summarize_patterns(patterns: list[str] | str | None) -> str:
     if patterns is None:
         return "None"
@@ -99,12 +129,21 @@ def _summarize_patterns(patterns: list[str] | str | None) -> str:
     return f"{len(patterns)} paths [{preview}{suffix}]"
 
 
+def _clone_item_tensors(item: dict) -> dict:
+    """Clone tensor values to safely reuse a cached sample across workers."""
+    cloned = {}
+    for key, val in item.items():
+        cloned[key] = val.clone() if torch.is_tensor(val) else val
+    return cloned
+
+
 def _snapshot_download_with_logging(
     repo_id: str,
     revision: str,
     local_dir: Path,
     allow_patterns: list[str] | str | None = None,
     ignore_patterns: list[str] | str | None = None,
+    force_download: bool = False,
 ) -> str:
     expected_total_files: int | None = len(allow_patterns) if isinstance(allow_patterns, list) else None
 
@@ -168,6 +207,7 @@ def _snapshot_download_with_logging(
             local_dir=local_dir,
             allow_patterns=allow_patterns,
             ignore_patterns=ignore_patterns,
+            force_download=force_download,
         )
     finally:
         stop_event.set()
@@ -304,6 +344,7 @@ class LeRobotDatasetMetadata:
         self,
         allow_patterns: list[str] | str | None = None,
         ignore_patterns: list[str] | str | None = None,
+        force_download: bool = False,
     ) -> None:
         _snapshot_download_with_logging(
             repo_id=self.repo_id,
@@ -311,6 +352,7 @@ class LeRobotDatasetMetadata:
             local_dir=self.root,
             allow_patterns=allow_patterns,
             ignore_patterns=ignore_patterns,
+            force_download=force_download,
         )
 
     @property
@@ -864,6 +906,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.episodes_since_last_encoding = 0
         self.vcodec = resolve_vcodec(vcodec)
         self._encoder_threads = encoder_threads
+        self._last_valid_item: dict | None = None
+        self._redownloaded_video_files: set[str] = set()
 
         # Unused attributes
         self.image_writer = None
@@ -998,6 +1042,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self,
         allow_patterns: list[str] | str | None = None,
         ignore_patterns: list[str] | str | None = None,
+        force_download: bool = False,
     ) -> None:
         _snapshot_download_with_logging(
             repo_id=self.repo_id,
@@ -1005,7 +1050,64 @@ class LeRobotDataset(torch.utils.data.Dataset):
             local_dir=self.root,
             allow_patterns=allow_patterns,
             ignore_patterns=ignore_patterns,
+            force_download=force_download,
         )
+
+    def _maybe_redownload_video_file(self, rel_video_path: Path, cause: Exception) -> bool:
+        rel_video_path_str = str(rel_video_path).replace("\\", "/")
+        if rel_video_path_str in self._redownloaded_video_files:
+            return False
+        self._redownloaded_video_files.add(rel_video_path_str)
+
+        logging.warning(
+            "Attempting one-time force re-download for video file '%s' in dataset '%s' after decode error: %s",
+            rel_video_path_str,
+            self.repo_id,
+            cause,
+        )
+
+        # Run download in a daemon thread with a hard timeout.
+        # Without this, a slow/unresponsive HuggingFace connection blocks the
+        # DataLoader worker indefinitely, stalling the training loop and
+        # triggering the NCCL watchdog timeout (SIGABRT on all ranks).
+        _REDOWNLOAD_TIMEOUT_S = 60.0
+        _result: list[bool] = [False]
+
+        def _do_download() -> None:
+            try:
+                self.pull_from_repo(allow_patterns=[rel_video_path_str], ignore_patterns=None, force_download=True)
+                if (self.root / rel_video_path).exists():
+                    _result[0] = True
+            except Exception as download_exc:  # noqa: BLE001
+                logging.warning(
+                    "Force re-download failed for '%s' in dataset '%s': %s",
+                    rel_video_path_str,
+                    self.repo_id,
+                    download_exc,
+                )
+
+        import threading
+        t = threading.Thread(target=_do_download, daemon=True)
+        t.start()
+        t.join(timeout=_REDOWNLOAD_TIMEOUT_S)
+        if t.is_alive():
+            logging.warning(
+                "Re-download timed out (%.0fs) for '%s' (dataset='%s') — skipping sample.",
+                _REDOWNLOAD_TIMEOUT_S,
+                rel_video_path_str,
+                self.repo_id,
+            )
+            return False
+
+        redownloaded_video_path = self.root / rel_video_path
+        if not redownloaded_video_path.exists():
+            logging.warning(
+                "Re-download completed but video file is still missing: '%s' (dataset='%s').",
+                redownloaded_video_path,
+                self.repo_id,
+            )
+            return False
+        return True
 
     def download(self, download_videos: bool = True) -> None:
         """Downloads the dataset from the given 'repo_id' at the provided version. If 'episodes' is given, this
@@ -1231,8 +1333,16 @@ class LeRobotDataset(torch.utils.data.Dataset):
             from_timestamp = ep.get(f"videos/{vid_key}/from_timestamp", 0.0)
             shifted_query_ts = [from_timestamp + ts for ts in query_ts]
 
-            video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
-            frames = decode_video_frames(video_path, shifted_query_ts, self.tolerance_s, self.video_backend)
+            rel_video_path = self.meta.get_video_file_path(ep_idx, vid_key)
+            video_path = self.root / rel_video_path
+            try:
+                frames = decode_video_frames(video_path, shifted_query_ts, self.tolerance_s, self.video_backend)
+            except Exception as exc:
+                if not _is_recoverable_video_error(exc):
+                    raise
+                if not self._maybe_redownload_video_file(rel_video_path, exc):
+                    raise
+                frames = decode_video_frames(video_path, shifted_query_ts, self.tolerance_s, self.video_backend)
             item[vid_key] = frames.squeeze(0)
 
         return item
@@ -1253,40 +1363,86 @@ class LeRobotDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx) -> dict:
         # Ensure dataset is loaded when we actually need to read from it
         self._ensure_hf_dataset_loaded()
-        item = self.hf_dataset[idx]
-        ep_idx = item["episode_index"].item()
-        # Use the absolute index from the dataset for delta timestamp calculations
-        abs_idx = item["index"].item()
 
-        query_indices = None
-        if self.delta_indices is not None:
-            query_indices, padding = self._get_query_indices(abs_idx, ep_idx)
-            query_result = self._query_hf_dataset(query_indices)
-            item = {**item, **padding}
-            for key, val in query_result.items():
-                item[key] = val
+        dataset_len = len(self)
+        max_attempts = 64
+        original_idx = idx
+        last_exc: Exception | None = None
 
-        if len(self.meta.video_keys) > 0:
-            current_ts = item["timestamp"].item()
-            query_timestamps = self._get_query_timestamps(current_ts, query_indices)
-            video_frames = self._query_videos(query_timestamps, ep_idx)
-            item = {**video_frames, **item}
+        for attempt in range(max_attempts):
+            try:
+                item = self.hf_dataset[idx]
+                ep_idx = item["episode_index"].item()
+                # Use the absolute index from the dataset for delta timestamp calculations
+                abs_idx = item["index"].item()
 
-        if self.image_transforms is not None:
-            image_keys = self.meta.camera_keys
-            for cam in image_keys:
-                item[cam] = self.image_transforms(item[cam])
+                query_indices = None
+                if self.delta_indices is not None:
+                    query_indices, padding = self._get_query_indices(abs_idx, ep_idx)
+                    query_result = self._query_hf_dataset(query_indices)
+                    item = {**item, **padding}
+                    for key, val in query_result.items():
+                        item[key] = val
 
-        # Add task as a string
-        task_idx = item["task_index"].item()
-        item["task"] = self.meta.tasks.iloc[task_idx].name
+                if len(self.meta.video_keys) > 0:
+                    current_ts = item["timestamp"].item()
+                    query_timestamps = self._get_query_timestamps(current_ts, query_indices)
+                    video_frames = self._query_videos(query_timestamps, ep_idx)
+                    item = {**video_frames, **item}
 
-        # add subtask information if available
-        if "subtask_index" in self.features and self.meta.subtasks is not None:
-            subtask_idx = item["subtask_index"].item()
-            item["subtask"] = self.meta.subtasks.iloc[subtask_idx].name
+                if self.image_transforms is not None:
+                    image_keys = self.meta.camera_keys
+                    for cam in image_keys:
+                        item[cam] = self.image_transforms(item[cam])
 
-        return item
+                # Add task as a string
+                task_idx = item["task_index"].item()
+                item["task"] = self.meta.tasks.iloc[task_idx].name
+
+                # add subtask information if available
+                if "subtask_index" in self.features and self.meta.subtasks is not None:
+                    subtask_idx = item["subtask_index"].item()
+                    item["subtask"] = self.meta.subtasks.iloc[subtask_idx].name
+
+                self._last_valid_item = item
+                return item
+            except Exception as exc:  # noqa: BLE001 - keep per-sample decode failures from crashing training.
+                if not _is_recoverable_video_error(exc) or dataset_len <= 1:
+                    raise
+                last_exc = exc
+                # Escape local corrupted regions by switching from local to non-local jumps.
+                if attempt < 8:
+                    idx = (idx + 1 + attempt) % dataset_len
+                else:
+                    jump = (attempt + 1) * 7919 + attempt * attempt
+                    idx = (original_idx + jump) % dataset_len
+                if attempt in {0, 4, 9, max_attempts - 1}:
+                    logging.warning(
+                        "Skipping corrupted/unsynced video sample in dataset '%s' "
+                        "(idx=%d, retry=%d/%d, next_idx=%d): %s",
+                        self.repo_id,
+                        original_idx,
+                        attempt + 1,
+                        max_attempts,
+                        idx,
+                        exc,
+                    )
+
+        if self._last_valid_item is not None:
+            logging.error(
+                "Failed to fetch a valid sample after %d attempts (start_idx=%d, repo_id=%s). "
+                "Returning cached fallback sample to keep training alive. Last error: %s",
+                max_attempts,
+                original_idx,
+                self.repo_id,
+                last_exc,
+            )
+            return _clone_item_tensors(self._last_valid_item)
+
+        raise RuntimeError(
+            f"Failed to fetch a valid sample after {max_attempts} attempts "
+            f"(start_idx={original_idx}, repo_id={self.repo_id})."
+        ) from last_exc
 
     def __repr__(self):
         feature_keys = list(self.features)

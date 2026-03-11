@@ -58,7 +58,7 @@ class GrootPolicy(PreTrainedPolicy):
 
     def __init__(self, config: GrootConfig, **kwargs):
         """Initialize Groot policy wrapper."""
-        super().__init__(config)
+        super().__init__(config, **kwargs)
         config.validate_features()
         self.config = config
 
@@ -95,8 +95,13 @@ class GrootPolicy(PreTrainedPolicy):
 
         return model
 
+
     def _apply_lora_to_backbone(self, model) -> None:
-        """Apply LoRA adapters to backbone LLM for parameter-efficient fine-tuning."""
+        """Apply LoRA adapters to backbone LLM for parameter-efficient fine-tuning.
+
+        Keeps pretrained base weights frozen; only the low-rank adapters are trained.
+        This preserves GR00T generalisation while adapting to the target task.
+        """
         from peft import LoraConfig, get_peft_model
 
         lora_config = LoraConfig(

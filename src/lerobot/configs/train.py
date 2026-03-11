@@ -87,6 +87,19 @@ class TrainPipelineConfig(HubMixin):
     joint_reconstruction_cot_do_sample: bool = False
     joint_reconstruction_cot_temperature: float = 0.7
     joint_reconstruction_cot_top_p: float = 0.9
+    # ── Structured CoT generation (spot-check during training, every N steps) ──
+    # Generates INIT/TICK JSON schema responses using cot_schema.py.
+    # Outputs are logged to {output_dir}/cot_traces/ and wandb — NOT used in loss.
+    cot_generation_enable: bool = False
+    cot_generation_freq_steps: int = 200       # generate every N training steps
+    cot_generation_max_new_tokens: int = 900   # token budget for JSON output
+    cot_generation_do_sample: bool = True
+    cot_generation_temperature: float = 0.7
+    cot_generation_top_p: float = 0.9
+    cot_generation_dataset_family: str = "dex3"   # "dex3" | "humanoid_everyday"
+    cot_generation_time_horizon_s: float = 40.0   # expected episode length in seconds
+    cot_generation_terminal_failure_cost: float = 100.0  # C_fail for RECAP reward spec
+    cot_generation_session_per_episode: bool = True  # track INIT/TICK per episode
     use_policy_training_preset: bool = True
     optimizer: OptimizerConfig | None = None
     scheduler: LRSchedulerConfig | None = None
@@ -193,6 +206,16 @@ class TrainPipelineConfig(HubMixin):
             raise ValueError("joint_reconstruction_cot_temperature must be > 0.")
         if not (0 < self.joint_reconstruction_cot_top_p <= 1):
             raise ValueError("joint_reconstruction_cot_top_p must be in (0, 1].")
+        if self.cot_generation_freq_steps < 1:
+            raise ValueError("cot_generation_freq_steps must be >= 1.")
+        if self.cot_generation_max_new_tokens < 1:
+            raise ValueError("cot_generation_max_new_tokens must be >= 1.")
+        if not (0 < self.cot_generation_temperature <= 5.0):
+            raise ValueError("cot_generation_temperature must be in (0, 5].")
+        if not (0 < self.cot_generation_top_p <= 1):
+            raise ValueError("cot_generation_top_p must be in (0, 1].")
+        if self.cot_generation_time_horizon_s <= 0:
+            raise ValueError("cot_generation_time_horizon_s must be > 0.")
 
         if not self.use_policy_training_preset and (self.optimizer is None or self.scheduler is None):
             raise ValueError("Optimizer and Scheduler must be set when the policy presets are not used.")

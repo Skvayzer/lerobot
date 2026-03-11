@@ -914,6 +914,8 @@ class GrootCoTPolicy(PreTrainedPolicy):
         self,
         batch: dict[str, Tensor],
         *,
+        cot_session: "Any | None" = None,
+        dataset_meta: "dict | None" = None,
         max_new_tokens: int = 64,
         do_sample: bool = False,
         temperature: float = 0.7,
@@ -924,6 +926,8 @@ class GrootCoTPolicy(PreTrainedPolicy):
         groot_inputs = self._build_groot_inputs(batch, include_action=False)
         return self._groot_model.extract_cot_trace(
             groot_inputs,
+            cot_session=cot_session,
+            dataset_meta=dataset_meta,
             max_new_tokens=max_new_tokens,
             do_sample=do_sample,
             temperature=temperature,
