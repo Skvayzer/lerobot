@@ -72,24 +72,13 @@ def _load_gr00t_n1d6(base_model_path: str, use_flash_attention: bool) -> "Gr00tN
             trust_remote_code=True,
         )
 
-    # ROCm path: bypass assertion, force eager attention
-    _orig_init = _eagle_module.EagleBackbone.__init__
-
-    def _patched_init(self_inner, *args, use_flash_attention=True, **kwargs):
-        # Call original with use_flash_attention=True to satisfy the assertion,
-        # then immediately patch the config to use eager attention.
-        _orig_init(self_inner, *args, use_flash_attention=True, **kwargs)
-        _force_eager_attn(self_inner.model.config)
-        print("[GROOT-N16] Patched EagleBackbone to use eager attention (ROCm compat).")
-
-    _eagle_module.EagleBackbone.__init__ = _patched_init
-    try:
-        model = Gr00tN1d6.from_pretrained(
-            base_model_path,
-            trust_remote_code=True,
-        )
-    finally:
-        _eagle_module.EagleBackbone.__init__ = _orig_init
+    # ROCm path: eagle_backbone.py has been patched to accept use_flash_attention=False
+    # and set eager attention on the config before AutoModel.from_config().
+    # We load directly with no extra monkey-patching needed.
+    model = Gr00tN1d6.from_pretrained(
+        base_model_path,
+        trust_remote_code=True,
+    )
 
     # Belt-and-suspenders: patch backbone config again after loading
     _force_eager_attn(model.backbone.model.config)
