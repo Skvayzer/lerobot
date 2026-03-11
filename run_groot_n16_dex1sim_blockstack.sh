@@ -61,6 +61,52 @@ else
     echo "gr00t already installed: $(python -c 'import gr00t; print(gr00t.__version__)')"
 fi
 
+# Patch Eagle3_VL model for ROCm: relax hard flash_attention_2 assertions so
+# eager attention (our ROCm fallback) is accepted for Qwen2/Qwen3 language models.
+# This must run before the training script imports gr00t.
+GROOT_MODULES_DIR=/vast/users/chenyuan.chen/Isaac-GR00T/gr00t/model/modules
+HF_EAGLE_CACHE=/vast/users/chenyuan.chen/.cache/huggingface/modules/transformers_modules/Eagle_hyphen_Block2A_hyphen_2B_hyphen_v2
+python3 - <<'PYEOF'
+import os, re
+
+TARGETS = [
+    os.environ.get(
+        "GROOT_MODULES_DIR",
+        "/vast/users/chenyuan.chen/Isaac-GR00T/gr00t/model/modules"
+    ) + "/nvidia/Eagle-Block2A-2B-v2/modeling_eagle3_vl.py",
+    os.environ.get(
+        "HF_EAGLE_CACHE",
+        "/vast/users/chenyuan.chen/.cache/huggingface/modules/transformers_modules/Eagle_hyphen_Block2A_hyphen_2B_hyphen_v2"
+    ) + "/modeling_eagle3_vl.py",
+]
+
+# Replace the hard flash_attention_2 assertion for Qwen2/Qwen3 with a no-op comment.
+# The assertion is multi-line, so we use regex with DOTALL.
+ASSERT_PATTERN = re.compile(
+    r'assert \(\s*config\.text_config\._attn_implementation == "flash_attention_2"\s*\)'
+    r',\s*f"(Qwen[23]) must use flash_attention_2 but got \{config\.text_config\._attn_implementation\}"',
+    re.DOTALL,
+)
+ASSERT_REPLACEMENT = (
+    r'pass  # ROCm compat: relaxed flash_attention_2 assertion for \1'
+)
+
+for path in TARGETS:
+    if not os.path.exists(path):
+        print(f"SKIP (not found): {path}")
+        continue
+    with open(path) as f:
+        content = f.read()
+    patched = ASSERT_PATTERN.sub(ASSERT_REPLACEMENT, content)
+    if patched == content:
+        print(f"Already patched or no match: {path}")
+    else:
+        with open(path, "w") as f:
+            f.write(patched)
+        print(f"Patched Eagle3_VL assertions: {path}")
+PYEOF
+export GROOT_MODULES_DIR HF_EAGLE_CACHE
+
 CACHE_ROOT=/tmp/$USER/rocm_cache_${SLURM_JOB_ID}
 mkdir -p "$CACHE_ROOT"/{miopen_db,miopen_cache,torch_kernels,xdg_cache}
 chmod -R u+rwX "$CACHE_ROOT"
