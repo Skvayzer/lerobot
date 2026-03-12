@@ -32,15 +32,15 @@ export TOKENIZERS_PARALLELISM=false
 export HF_HUB_DISABLE_XET=1
 export HF_HUB_ENABLE_HF_TRANSFER=0
 
-# Eagle2.5 fast image processor requires transformers >= 4.53
+# Eagle2.5 fast image processor requires transformers >= 4.55
 # (group_images_by_shape disable_grouping, _prepare_image_like_inputs, etc.)
 CURRENT_TF=$(python -c "import transformers; print(transformers.__version__)" 2>/dev/null)
 echo "Current transformers: $CURRENT_TF"
-if python -c "from packaging.version import Version; exit(0 if Version('$CURRENT_TF') >= Version('4.53.0') else 1)" 2>/dev/null; then
-    echo "transformers >= 4.53, OK for Eagle2.5"
+if [ "$CURRENT_TF" = "4.55.0" ]; then
+    echo "transformers 4.55.0, OK"
 else
-    echo "Upgrading transformers to >= 4.53 for Eagle2.5 compat..."
-    pip install 'transformers>=4.53.0' 2>&1 | tail -5
+    echo "Installing transformers==4.55.0 (current: $CURRENT_TF) ..."
+    pip install 'transformers==4.55.0' 2>&1 | tail -5
     echo "transformers now: $(python -c 'import transformers; print(transformers.__version__)')"
 fi
 

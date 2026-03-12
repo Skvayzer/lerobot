@@ -59,14 +59,15 @@ else
     echo "gr00t already installed: $(python -c 'import gr00t; print(gr00t.__version__)')"
 fi
 
-# gr00t requires transformers==4.51.3
-CURRENT_TRANSFORMERS=$(python -c "import transformers; print(transformers.__version__)" 2>/dev/null)
-if [ "$CURRENT_TRANSFORMERS" != "4.51.3" ]; then
-    echo "Installing transformers==4.51.3 (current: $CURRENT_TRANSFORMERS) ..."
-    pip install 'transformers==4.51.3' 2>&1 | grep -v "^Requirement already" | tail -5
-    echo "transformers pinned to 4.51.3"
+# Pin transformers to 4.55.0 (compatible with Eagle2.5/Eagle3 and HybridCache)
+CURRENT_TF=$(python -c "import transformers; print(transformers.__version__)" 2>/dev/null)
+echo "Current transformers: $CURRENT_TF"
+if [ "$CURRENT_TF" != "4.55.0" ]; then
+    echo "Installing transformers==4.55.0 (current: $CURRENT_TF) ..."
+    pip install 'transformers==4.55.0' 2>&1 | tail -5
+    echo "transformers now: $(python -c 'import transformers; print(transformers.__version__)')"
 else
-    echo "transformers already at 4.51.3"
+    echo "transformers 4.55.0, OK"
 fi
 
 # Patch Eagle3_VL model for ROCm
