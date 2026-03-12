@@ -248,6 +248,33 @@ for fpath in IMG_FAST_PATHS:
         print(f"Patched image_processing_eagle3_vl_fast.py: {fpath}")
     else:
         print(f"Already patched or no match: {os.path.basename(fpath)}")
+
+# --- Fix: validate_init_kwargs returns tuple in transformers >= 4.52 ---
+# Eagle3 processing_eagle3_vl.py assigns the result to a single variable,
+# but newer transformers returns (unused_kwargs, valid_kwargs) tuple.
+PROC_EAGLE3_PATHS = [
+    os.environ.get("GROOT_MODULES_DIR", "/vast/users/chenyuan.chen/Isaac-GR00T/gr00t/model/modules")
+    + "/nvidia/Eagle-Block2A-2B-v2/processing_eagle3_vl.py",
+    os.environ.get("HF_EAGLE_CACHE", "/vast/users/chenyuan.chen/.cache/huggingface/modules/transformers_modules/Eagle_hyphen_Block2A_hyphen_2B_hyphen_v2")
+    + "/processing_eagle3_vl.py",
+]
+OLD_VALIDATE = "unused_kwargs = cls.validate_init_kwargs(\n            processor_config=processor_dict, valid_kwargs=cls.valid_kwargs\n        )"
+NEW_VALIDATE = "_validate_result = cls.validate_init_kwargs(\n            processor_config=processor_dict, valid_kwargs=cls.valid_kwargs\n        )\n        unused_kwargs = _validate_result[0] if isinstance(_validate_result, tuple) else _validate_result"
+for proc_path in PROC_EAGLE3_PATHS:
+    if not os.path.exists(proc_path):
+        print(f"SKIP (not found): {proc_path}")
+        continue
+    with open(proc_path) as f:
+        content = f.read()
+    if OLD_VALIDATE in content:
+        content = content.replace(OLD_VALIDATE, NEW_VALIDATE)
+        with open(proc_path, "w") as f:
+            f.write(content)
+        print(f"Patched validate_init_kwargs: {proc_path}")
+    elif "_validate_result" in content:
+        print(f"validate_init_kwargs already patched: {os.path.basename(proc_path)}")
+    else:
+        print(f"WARN: validate_init_kwargs pattern not found in {os.path.basename(proc_path)}")
 PYEOF
 export GROOT_MODULES_DIR HF_EAGLE_CACHE
 
