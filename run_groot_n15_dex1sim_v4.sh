@@ -93,36 +93,47 @@ for d in SEARCH_DIRS:
             print(f"VideoInput OK: {os.path.basename(fpath)}")
 
     # --- Fix 2: _prepare_image_like_inputs shim in fast processor ---
+    # Must go BEFORE @add_start_docstrings decorator (not between decorator and class)
     fast_path = os.path.join(d, "image_processing_eagle2_5_vl_fast.py")
     if not os.path.exists(fast_path):
         continue
     with open(fast_path) as f:
-        content = f.read()
+        lines = f.readlines()
 
-    # Add a monkey-patch at the top of the file (after imports) that adds
-    # _prepare_image_like_inputs as an alias for _prepare_input_images
-    # if it doesn't exist on the base class
-    SHIM_MARKER = "# _prepare_image_like_inputs compat shim"
-    if SHIM_MARKER not in content:
-        # Find the class definition line
-        class_line = "class Eagle25VLImageProcessorFast(BaseImageProcessorFast):"
-        if class_line in content:
-            shim_code = (
-                "\n"
-                f"{SHIM_MARKER}\n"
-                "if not hasattr(BaseImageProcessorFast, '_prepare_image_like_inputs'):\n"
-                "    BaseImageProcessorFast._prepare_image_like_inputs = "
-                "BaseImageProcessorFast._prepare_input_images\n"
-                "\n"
-            )
-            content = content.replace(class_line, shim_code + class_line)
-            with open(fast_path, "w") as f:
-                f.write(content)
-            print(f"Patched _prepare_image_like_inputs shim: {fast_path}")
-        else:
-            print(f"WARN: class not found in {fast_path}")
+    SHIM_LINES = [
+        "# _prepare_image_like_inputs compat shim\n",
+        "if not hasattr(BaseImageProcessorFast, '_prepare_image_like_inputs'):\n",
+        "    BaseImageProcessorFast._prepare_image_like_inputs = BaseImageProcessorFast._prepare_input_images\n",
+    ]
+    # First: remove any existing shim lines (may be mis-placed)
+    cleaned = [l for l in lines if l.rstrip("\n") + "\n" not in SHIM_LINES]
+
+    # Find the @add_start_docstrings line that precedes Eagle25VLImageProcessorFast
+    insert_idx = None
+    for i, l in enumerate(cleaned):
+        if l.strip().startswith("@add_start_docstrings("):
+            # Check if this decorator is for Eagle25VLImageProcessorFast
+            for j in range(i + 1, min(i + 30, len(cleaned))):
+                if "class Eagle25VLImageProcessorFast" in cleaned[j]:
+                    insert_idx = i
+                    break
+            if insert_idx is not None:
+                break
+
+    if insert_idx is None:
+        # Fallback: find class line directly
+        for i, l in enumerate(cleaned):
+            if "class Eagle25VLImageProcessorFast" in l:
+                insert_idx = i
+                break
+
+    if insert_idx is not None:
+        cleaned = cleaned[:insert_idx] + ["\n"] + SHIM_LINES + ["\n"] + cleaned[insert_idx:]
+        with open(fast_path, "w") as f:
+            f.writelines(cleaned)
+        print(f"Patched _prepare_image_like_inputs: {fast_path}")
     else:
-        print(f"_prepare_image_like_inputs shim OK: {os.path.basename(fast_path)}")
+        print(f"WARN: Eagle25VLImageProcessorFast not found in {fast_path}")
 EAGLE_PATCH
 echo "Eagle2.5 patching done."
 

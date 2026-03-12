@@ -91,6 +91,11 @@ class Eagle25VLFastImageProcessorKwargs(ImagesKwargs):
     do_convert_rgb: bool | None
 
 
+# _prepare_image_like_inputs compat shim (added in transformers 4.53, needed for 4.51.x)
+if not hasattr(BaseImageProcessorFast, '_prepare_image_like_inputs'):
+    BaseImageProcessorFast._prepare_image_like_inputs = BaseImageProcessorFast._prepare_input_images
+
+
 @add_start_docstrings(
     "Constructs a fast ConvNeXT image processor. Based on [`SiglipImageProcessor`] with incorporation of processing each video frame.",
     # BASE_IMAGE_PROCESSOR_FAST_DOCSTRING, TODO: this was depreciated from transformers remove!
@@ -104,11 +109,6 @@ class Eagle25VLFastImageProcessorKwargs(ImagesKwargs):
             number of patches in the batch. Padding will be applied to the bottom and right with zeros.
     """,
 )
-# _prepare_image_like_inputs compat shim (added in transformers 4.53, needed for 4.51.x)
-if not hasattr(BaseImageProcessorFast, '_prepare_image_like_inputs'):
-    BaseImageProcessorFast._prepare_image_like_inputs = BaseImageProcessorFast._prepare_input_images
-
-
 class Eagle25VLImageProcessorFast(BaseImageProcessorFast):
     resample = PILImageResampling.BICUBIC
     image_mean = IMAGENET_STANDARD_MEAN
