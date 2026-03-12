@@ -7,9 +7,9 @@
 #SBATCH --partition=faculty
 #SBATCH --qos=gtqos
 #SBATCH --mem=256G
-#SBATCH --job-name=groot_n15_dex1sim_v5
-#SBATCH --output=/vast/users/chenyuan.chen/constantine/unitree_IL_lerobot/unitree_lerobot/lerobot/slurm_groot_n15_dex1sim_v5_%j.log
-#SBATCH --error=/vast/users/chenyuan.chen/constantine/unitree_IL_lerobot/unitree_lerobot/lerobot/slurm_groot_n15_dex1sim_v5_%j.log
+#SBATCH --job-name=groot_n15_dex1sim_v6
+#SBATCH --output=/vast/users/chenyuan.chen/constantine/unitree_IL_lerobot/unitree_lerobot/lerobot/slurm_groot_n15_dex1sim_v6_%j.log
+#SBATCH --error=/vast/users/chenyuan.chen/constantine/unitree_IL_lerobot/unitree_lerobot/lerobot/slurm_groot_n15_dex1sim_v6_%j.log
 
 set -euo pipefail
 
@@ -17,8 +17,8 @@ LEROBOT_DIR=/vast/users/chenyuan.chen/constantine/unitree_IL_lerobot/unitree_ler
 cd "$LEROBOT_DIR"
 
 echo "=========================================="
-echo "GR00T N1.5 Dex1 Sim BlockStacking v5 (4 GPU, stats fix)"
-echo "Fixes: reinject_dataset_stats, eval processors, Eagle2.5 fast processor compat"
+echo "GR00T N1.5 Dex1 Sim BlockStacking v6 (4 GPU, no LoRA)"
+echo "Fixes: reinject_dataset_stats, eval processors, Eagle2.5 fast proc compat, LoRA removed (default finetuning)"
 echo "Node: $(hostname) | Job: $SLURM_JOB_ID"
 echo "Start: $(date)"
 echo "=========================================="
@@ -77,7 +77,7 @@ snapshot_download('unitreerobotics/G1_Dex1_StackRygBlock_Dataset_Sim', repo_type
 print('Download complete')
 " || echo "WARNING: pre-download failed, training will attempt download on-the-fly"
 
-OUTPUT_DIR=outputs/train/$(date +%Y%m%d_%H%M%S)_groot_n15_dex1sim_blockstack_v5
+OUTPUT_DIR=outputs/train/$(date +%Y%m%d_%H%M%S)_groot_n15_dex1sim_blockstack_v6
 
 accelerate launch \
   --multi_gpu --num_processes="$NUM_GPUS" --num_machines=1 --mixed_precision=no \
@@ -90,9 +90,6 @@ accelerate launch \
   --policy.tune_visual=false \
   --policy.tune_projector=true \
   --policy.tune_diffusion_model=true \
-  --policy.lora_rank=16 \
-  --policy.lora_alpha=32 \
-  --policy.lora_dropout=0.05 \
   --policy.use_bf16=true \
   --policy.push_to_hub=false \
   --dataset.repo_id=unitreerobotics/G1_Dex1_StackRygBlock_Dataset_Sim \
@@ -110,7 +107,7 @@ accelerate launch \
   --wandb.project=G1_Groot_Baselines \
   --wandb.entity=skvayzer \
   --wandb.disable_artifact=true \
-  --wandb.notes="GR00T-N1.5 Dex1 Sim v5: 4GPU, reinject_dataset_stats fix, Eagle2.5 fast proc compat"
+  --wandb.notes="GR00T-N1.5 Dex1 Sim v6: 4GPU, no LoRA, default finetuning (projector+diffusion only)"
 
 echo "Done: $(date)"
 echo "Output: $OUTPUT_DIR"
