@@ -217,7 +217,9 @@ def _build_eagle_processor(tokenizer_assets_repo: str = DEFAULT_TOKENIZER_ASSETS
             "Vendor files are copied during model creation. Create the policy/model first, "
             "or call ensure_eagle_cache_ready() before building processors."
         )
-    proc = AutoProcessor.from_pretrained(str(cache_dir), trust_remote_code=True, use_fast=True)
+    # use_fast=False: Eagle25VLImageProcessorFast requires transformers >= 4.53
+    # (_prepare_image_like_inputs doesn't exist in older versions).
+    proc = AutoProcessor.from_pretrained(str(cache_dir), trust_remote_code=True, use_fast=False)
     proc.tokenizer.padding_side = "left"
     return proc
 
