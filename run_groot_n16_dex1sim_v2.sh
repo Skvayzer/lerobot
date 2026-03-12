@@ -309,6 +309,26 @@ for fpath in IMG_FAST_PATHS:
     with open(fpath, "w") as f:
         f.write(content)
     print(f"Patched _prepare_input_images shim: {fpath}")
+
+# --- Fix: _prepare_images_structure signature changed in transformers >= 4.55 ---
+# Eagle3 override only accepts (self, images) but base class now passes expected_ndims.
+# Add **kwargs to the override to accept any extra arguments.
+for fpath in IMG_FAST_PATHS:
+    if not os.path.exists(fpath):
+        continue
+    with open(fpath) as f:
+        content = f.read()
+    old_sig = "def _prepare_images_structure(\n        self,\n        images: ImageInput,\n    ) -> ImageInput:"
+    new_sig = "def _prepare_images_structure(\n        self,\n        images: ImageInput,\n        **kwargs,\n    ) -> ImageInput:"
+    if old_sig in content:
+        content = content.replace(old_sig, new_sig)
+        with open(fpath, "w") as f:
+            f.write(content)
+        print(f"Patched _prepare_images_structure: {fpath}")
+    elif "**kwargs" in content.split("_prepare_images_structure")[1][:200] if "_prepare_images_structure" in content else False:
+        print(f"_prepare_images_structure already patched: {os.path.basename(fpath)}")
+    else:
+        print(f"WARN: _prepare_images_structure pattern not found in {os.path.basename(fpath)}")
 PYEOF
 export GROOT_MODULES_DIR HF_EAGLE_CACHE
 
