@@ -32,6 +32,18 @@ export TOKENIZERS_PARALLELISM=false
 export HF_HUB_DISABLE_XET=1
 export HF_HUB_ENABLE_HF_TRANSFER=0
 
+# Eagle2.5 fast image processor requires transformers >= 4.53
+# (group_images_by_shape disable_grouping, _prepare_image_like_inputs, etc.)
+CURRENT_TF=$(python -c "import transformers; print(transformers.__version__)" 2>/dev/null)
+echo "Current transformers: $CURRENT_TF"
+if python -c "from packaging.version import Version; exit(0 if Version('$CURRENT_TF') >= Version('4.53.0') else 1)" 2>/dev/null; then
+    echo "transformers >= 4.53, OK for Eagle2.5"
+else
+    echo "Upgrading transformers to >= 4.53 for Eagle2.5 compat..."
+    pip install 'transformers>=4.53.0' 2>&1 | tail -5
+    echo "transformers now: $(python -c 'import transformers; print(transformers.__version__)')"
+fi
+
 CACHE_ROOT=/tmp/$USER/rocm_cache_${SLURM_JOB_ID}
 mkdir -p "$CACHE_ROOT"/{miopen_db,miopen_cache,torch_kernels,xdg_cache}
 chmod -R u+rwX "$CACHE_ROOT"
@@ -47,95 +59,13 @@ python -c "import torch; print(f'CUDA devices: {torch.cuda.device_count()}')"
 
 git pull origin unitree-features || echo "WARNING: git pull failed, continuing"
 
-# Patch HF-cached Eagle2.5 processor for transformers 4.51.3 compat
-# Fixes: (1) VideoInput import, (2) _prepare_image_like_inputs (added in 4.53)
-echo "Patching Eagle2.5 HF cache for transformers 4.51.3 compat..."
-python3 - <<'EAGLE_PATCH'
-import os, glob
-
-# All directories that may contain Eagle2.5 processor files
-SEARCH_DIRS = []
-for base in [
-    os.path.expanduser("~/.cache/huggingface/modules/transformers_modules"),
-    os.path.expanduser("~/.cache/huggingface/lerobot/lerobot"),
-]:
-    for pattern in ["eagle2hg-processor-groot-n1p5", "eagle2hg*"]:
-        SEARCH_DIRS.extend(glob.glob(os.path.join(base, pattern)))
-
-for d in SEARCH_DIRS:
-    if not os.path.isdir(d):
-        continue
-
-    # --- Fix 1: VideoInput import in processing_eagle2_5_vl.py ---
-    for fname in ["processing_eagle2_5_vl.py", "image_processing_eagle2_5_vl_fast.py"]:
-        fpath = os.path.join(d, fname)
-        if not os.path.exists(fpath):
-            continue
-        with open(fpath) as f:
-            content = f.read()
-        changed = False
-        old_vi = "from transformers.video_utils import VideoInput"
-        new_vi = (
-            "try:\n"
-            "    from transformers.video_utils import VideoInput\n"
-            "except ImportError:\n"
-            "    from transformers.image_utils import ImageInput as VideoInput  # compat"
-        )
-        if old_vi in content and "try:" not in content.split(old_vi)[0][-10:]:
-            content = content.replace(old_vi, new_vi)
-            changed = True
-
-        if changed:
-            with open(fpath, "w") as f:
-                f.write(content)
-            print(f"Patched VideoInput: {fpath}")
-        else:
-            print(f"VideoInput OK: {os.path.basename(fpath)}")
-
-    # --- Fix 2: _prepare_image_like_inputs shim in fast processor ---
-    # Must go BEFORE @add_start_docstrings decorator (not between decorator and class)
-    fast_path = os.path.join(d, "image_processing_eagle2_5_vl_fast.py")
-    if not os.path.exists(fast_path):
-        continue
-    with open(fast_path) as f:
-        lines = f.readlines()
-
-    SHIM_LINES = [
-        "# _prepare_image_like_inputs compat shim\n",
-        "if not hasattr(BaseImageProcessorFast, '_prepare_image_like_inputs'):\n",
-        "    BaseImageProcessorFast._prepare_image_like_inputs = BaseImageProcessorFast._prepare_input_images\n",
-    ]
-    # First: remove any existing shim lines (may be mis-placed)
-    cleaned = [l for l in lines if l.rstrip("\n") + "\n" not in SHIM_LINES]
-
-    # Find the @add_start_docstrings line that precedes Eagle25VLImageProcessorFast
-    insert_idx = None
-    for i, l in enumerate(cleaned):
-        if l.strip().startswith("@add_start_docstrings("):
-            # Check if this decorator is for Eagle25VLImageProcessorFast
-            for j in range(i + 1, min(i + 30, len(cleaned))):
-                if "class Eagle25VLImageProcessorFast" in cleaned[j]:
-                    insert_idx = i
-                    break
-            if insert_idx is not None:
-                break
-
-    if insert_idx is None:
-        # Fallback: find class line directly
-        for i, l in enumerate(cleaned):
-            if "class Eagle25VLImageProcessorFast" in l:
-                insert_idx = i
-                break
-
-    if insert_idx is not None:
-        cleaned = cleaned[:insert_idx] + ["\n"] + SHIM_LINES + ["\n"] + cleaned[insert_idx:]
-        with open(fast_path, "w") as f:
-            f.writelines(cleaned)
-        print(f"Patched _prepare_image_like_inputs: {fast_path}")
-    else:
-        print(f"WARN: Eagle25VLImageProcessorFast not found in {fast_path}")
-EAGLE_PATCH
-echo "Eagle2.5 patching done."
+# Clean up any previously patched Eagle2.5 HF cache files
+# (With transformers >= 4.53, no patches are needed — delete cached copies
+# so they get re-downloaded fresh from HF hub)
+echo "Clearing stale Eagle2.5 HF cache (will re-download fresh)..."
+rm -rf ~/.cache/huggingface/modules/transformers_modules/eagle2hg-processor-groot-n1p5
+rm -rf ~/.cache/huggingface/modules/transformers_modules/eagle2hg_hyphen_processor_hyphen_groot_hyphen_n1p5
+echo "Eagle2.5 cache cleared."
 
 # Pre-download the dataset
 echo "Pre-downloading Dex1 Sim dataset..."
