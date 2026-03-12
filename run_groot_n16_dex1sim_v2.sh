@@ -24,7 +24,7 @@ echo "Node: $(hostname) | Job: $SLURM_JOB_ID"
 echo "Start: $(date)"
 echo "=========================================="
 
-source /vast/users/chenyuan.chen/miniconda3/bin/activate unitree_lerobot_amd
+source /vast/users/chenyuan.chen/miniconda3/bin/activate unitree_lerobot_amd_n16
 
 unset HF_HUB_OFFLINE TRANSFORMERS_OFFLINE HF_DATASETS_OFFLINE
 export HF_HOME=/vast/users/chenyuan.chen/.cache/huggingface
@@ -59,16 +59,8 @@ else
     echo "gr00t already installed: $(python -c 'import gr00t; print(gr00t.__version__)')"
 fi
 
-# Pin transformers to 4.55.0 (compatible with Eagle2.5/Eagle3 and HybridCache)
-CURRENT_TF=$(python -c "import transformers; print(transformers.__version__)" 2>/dev/null)
-echo "Current transformers: $CURRENT_TF"
-if [ "$CURRENT_TF" != "4.55.0" ]; then
-    echo "Installing transformers==4.55.0 (current: $CURRENT_TF) ..."
-    pip install 'transformers==4.55.0' 2>&1 | tail -5
-    echo "transformers now: $(python -c 'import transformers; print(transformers.__version__)')"
-else
-    echo "transformers 4.55.0, OK"
-fi
+# gr00t + Eagle3 requires transformers==4.51.3 (pinned in unitree_lerobot_amd_n16 env)
+echo "transformers: $(python -c 'import transformers; print(transformers.__version__)' 2>/dev/null)"
 
 # Patch Eagle3_VL model for ROCm
 GROOT_MODULES_DIR=/vast/users/chenyuan.chen/Isaac-GR00T/gr00t/model/modules
@@ -248,87 +240,6 @@ for fpath in IMG_FAST_PATHS:
         print(f"Patched image_processing_eagle3_vl_fast.py: {fpath}")
     else:
         print(f"Already patched or no match: {os.path.basename(fpath)}")
-
-# --- Fix: validate_init_kwargs returns tuple in transformers >= 4.52 ---
-# Eagle3 processing_eagle3_vl.py assigns the result to a single variable,
-# but newer transformers returns (unused_kwargs, valid_kwargs) tuple.
-PROC_EAGLE3_PATHS = [
-    os.environ.get("GROOT_MODULES_DIR", "/vast/users/chenyuan.chen/Isaac-GR00T/gr00t/model/modules")
-    + "/nvidia/Eagle-Block2A-2B-v2/processing_eagle3_vl.py",
-    os.environ.get("HF_EAGLE_CACHE", "/vast/users/chenyuan.chen/.cache/huggingface/modules/transformers_modules/Eagle_hyphen_Block2A_hyphen_2B_hyphen_v2")
-    + "/processing_eagle3_vl.py",
-]
-OLD_VALIDATE = "unused_kwargs = cls.validate_init_kwargs(\n            processor_config=processor_dict, valid_kwargs=cls.valid_kwargs\n        )"
-NEW_VALIDATE = "_validate_result = cls.validate_init_kwargs(\n            processor_config=processor_dict, valid_kwargs=cls.valid_kwargs\n        )\n        unused_kwargs = _validate_result[0] if isinstance(_validate_result, tuple) else _validate_result"
-for proc_path in PROC_EAGLE3_PATHS:
-    if not os.path.exists(proc_path):
-        print(f"SKIP (not found): {proc_path}")
-        continue
-    with open(proc_path) as f:
-        content = f.read()
-    if OLD_VALIDATE in content:
-        content = content.replace(OLD_VALIDATE, NEW_VALIDATE)
-        with open(proc_path, "w") as f:
-            f.write(content)
-        print(f"Patched validate_init_kwargs: {proc_path}")
-    elif "_validate_result" in content:
-        print(f"validate_init_kwargs already patched: {os.path.basename(proc_path)}")
-    else:
-        print(f"WARN: validate_init_kwargs pattern not found in {os.path.basename(proc_path)}")
-
-# --- Fix: _prepare_input_images renamed to _prepare_image_like_inputs in transformers >= 4.55 ---
-# Eagle3 fast processor calls self._prepare_input_images() which no longer exists.
-# Add a reverse shim: alias old name to new name on BaseImageProcessorFast.
-for fpath in IMG_FAST_PATHS:
-    if not os.path.exists(fpath):
-        continue
-    with open(fpath) as f:
-        content = f.read()
-    SHIM_MARKER = "# _prepare_input_images compat shim"
-    if SHIM_MARKER in content:
-        print(f"_prepare_input_images shim already present: {os.path.basename(fpath)}")
-        continue
-    # Find the @add_start_docstrings decorator before Eagle3_VLImageProcessorFast
-    class_line = "class Eagle3_VLImageProcessorFast("
-    if class_line not in content:
-        print(f"WARN: Eagle3_VLImageProcessorFast class not found in {os.path.basename(fpath)}")
-        continue
-    shim = (
-        "\n" + SHIM_MARKER + "\n"
-        "from transformers.image_processing_utils_fast import BaseImageProcessorFast as _BIPF\n"
-        "if not hasattr(_BIPF, '_prepare_input_images') and hasattr(_BIPF, '_prepare_image_like_inputs'):\n"
-        "    _BIPF._prepare_input_images = _BIPF._prepare_image_like_inputs\n\n"
-    )
-    # Insert before @add_start_docstrings decorator (not between decorator and class)
-    idx_class = content.index(class_line)
-    # Search backwards for the decorator
-    decorator_marker = "@add_start_docstrings("
-    idx_dec = content.rfind(decorator_marker, 0, idx_class)
-    insert_idx = idx_dec if idx_dec >= 0 else idx_class
-    content = content[:insert_idx] + shim + content[insert_idx:]
-    with open(fpath, "w") as f:
-        f.write(content)
-    print(f"Patched _prepare_input_images shim: {fpath}")
-
-# --- Fix: _prepare_images_structure signature changed in transformers >= 4.55 ---
-# Eagle3 override only accepts (self, images) but base class now passes expected_ndims.
-# Add **kwargs to the override to accept any extra arguments.
-for fpath in IMG_FAST_PATHS:
-    if not os.path.exists(fpath):
-        continue
-    with open(fpath) as f:
-        content = f.read()
-    old_sig = "def _prepare_images_structure(\n        self,\n        images: ImageInput,\n    ) -> ImageInput:"
-    new_sig = "def _prepare_images_structure(\n        self,\n        images: ImageInput,\n        **kwargs,\n    ) -> ImageInput:"
-    if old_sig in content:
-        content = content.replace(old_sig, new_sig)
-        with open(fpath, "w") as f:
-            f.write(content)
-        print(f"Patched _prepare_images_structure: {fpath}")
-    elif "**kwargs" in content.split("_prepare_images_structure")[1][:200] if "_prepare_images_structure" in content else False:
-        print(f"_prepare_images_structure already patched: {os.path.basename(fpath)}")
-    else:
-        print(f"WARN: _prepare_images_structure pattern not found in {os.path.basename(fpath)}")
 PYEOF
 export GROOT_MODULES_DIR HF_EAGLE_CACHE
 
