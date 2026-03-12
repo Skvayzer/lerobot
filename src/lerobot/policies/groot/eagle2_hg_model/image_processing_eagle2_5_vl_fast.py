@@ -13,10 +13,13 @@ from transformers.image_processing_utils import (
 )
 from transformers.image_processing_utils_fast import (
     BaseImageProcessorFast,
-    ImagesKwargs,
     group_images_by_shape,
     reorder_images,
 )
+try:
+    from transformers.image_processing_utils_fast import ImagesKwargs
+except ImportError:
+    from transformers.processing_utils import ImagesKwargs
 from transformers.image_utils import (
     IMAGENET_STANDARD_MEAN,  # 0.5, 0.5, 0.5
     IMAGENET_STANDARD_STD,  # 0.5, 0.5, 0.5
@@ -35,7 +38,10 @@ from transformers.utils import (
     is_torch_available,
     is_torchvision_v2_available,
 )
-from transformers.video_utils import VideoInput
+try:
+    from transformers.video_utils import VideoInput
+except ImportError:
+    from transformers.image_utils import ImageInput as VideoInput  # transformers compat fallback
 
 if is_torch_available():
     import torch
@@ -82,6 +88,7 @@ class Eagle25VLFastImageProcessorKwargs(ImagesKwargs):
     use_thumbnail: bool | None
     pad_during_tiling: bool | None
     do_pad: bool | None
+    do_convert_rgb: bool | None
 
 
 @add_start_docstrings(

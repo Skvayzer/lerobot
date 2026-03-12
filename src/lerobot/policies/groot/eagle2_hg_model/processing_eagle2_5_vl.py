@@ -29,7 +29,10 @@ from transformers.image_utils import ImageInput
 from transformers.processing_utils import ProcessingKwargs, ProcessorMixin, Unpack
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 from transformers.utils import logging
-from transformers.video_utils import VideoInput
+try:
+    from transformers.video_utils import VideoInput
+except ImportError:
+    VideoInput = ImageInput  # transformers compat fallback
 
 logger = logging.get_logger(__name__)
 
