@@ -56,6 +56,7 @@ from lerobot.utils.train_utils import (
     get_step_identifier,
     load_training_state,
     prune_old_checkpoints,
+    reinject_dataset_stats,
     save_checkpoint,
     update_last_checkpoint,
 )
@@ -953,6 +954,11 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         **postprocessor_kwargs,
     )
 
+    # Ensure processor steps have the correct dataset stats immediately after creation.
+    # This guards against code-path bugs where stats from a base model or stale checkpoint
+    # end up in the processor instead of the actual training dataset stats.
+    reinject_dataset_stats(preprocessor, postprocessor, dataset.meta.stats)
+
     recap_indicator_lookup: dict[int, float] | None = None
     recap_indicator_key = str(getattr(cfg.policy, "recap_adv_indicator_key", "observation.extra.adv_indicator"))
     recap_indicator_null = float(getattr(cfg.policy, "recap_adv_indicator_null_value", -1.0))
@@ -1200,6 +1206,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         if cfg.save_checkpoint and is_saving_step:
             if is_main_process:
                 logging.info(f"Checkpoint policy after step {step}")
+                # Defensively re-inject dataset stats to prevent normalization mismatch
+                reinject_dataset_stats(preprocessor, postprocessor, dataset.meta.stats)
                 checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
                 save_checkpoint(
                     checkpoint_dir=checkpoint_dir,

@@ -13,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import logging
 import shutil
 from pathlib import Path
 
@@ -88,6 +89,44 @@ def prune_old_checkpoints(checkpoints_dir: Path, keep_last_n: int | None) -> lis
     for old_dir in to_remove:
         shutil.rmtree(old_dir)
     return to_remove
+
+
+def reinject_dataset_stats(
+    preprocessor: PolicyProcessorPipeline | None,
+    postprocessor: PolicyProcessorPipeline | None,
+    dataset_stats: dict | None,
+) -> None:
+    """Re-inject dataset stats into processor steps that use normalization.
+
+    This is a defensive measure to ensure that the correct dataset statistics
+    are always saved in checkpoints, even if something modifies them during
+    training (e.g., code version mismatch after git pull on cluster).
+    """
+    if dataset_stats is None:
+        return
+
+    for pipeline in [preprocessor, postprocessor]:
+        if pipeline is None:
+            continue
+        for step in pipeline.steps:
+            if hasattr(step, "stats") and hasattr(step, "normalize_min_max"):
+                step.stats = dataset_stats
+                # Validate: check action dim matches
+                new_action = dataset_stats.get("action", {}).get("min")
+                if new_action is not None:
+                    import numpy as np
+                    import torch
+
+                    if isinstance(new_action, (np.ndarray, torch.Tensor)):
+                        new_dim = new_action.shape[0] if hasattr(new_action, "shape") else len(new_action)
+                    else:
+                        new_dim = len(new_action)
+                    logging.info(
+                        "reinject_dataset_stats: set %s.stats action dim=%d (count=%s)",
+                        type(step).__name__,
+                        new_dim,
+                        dataset_stats.get("action", {}).get("count"),
+                    )
 
 
 def save_checkpoint(
