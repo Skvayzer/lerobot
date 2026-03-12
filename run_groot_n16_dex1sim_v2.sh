@@ -275,6 +275,40 @@ for proc_path in PROC_EAGLE3_PATHS:
         print(f"validate_init_kwargs already patched: {os.path.basename(proc_path)}")
     else:
         print(f"WARN: validate_init_kwargs pattern not found in {os.path.basename(proc_path)}")
+
+# --- Fix: _prepare_input_images renamed to _prepare_image_like_inputs in transformers >= 4.55 ---
+# Eagle3 fast processor calls self._prepare_input_images() which no longer exists.
+# Add a reverse shim: alias old name to new name on BaseImageProcessorFast.
+for fpath in IMG_FAST_PATHS:
+    if not os.path.exists(fpath):
+        continue
+    with open(fpath) as f:
+        content = f.read()
+    SHIM_MARKER = "# _prepare_input_images compat shim"
+    if SHIM_MARKER in content:
+        print(f"_prepare_input_images shim already present: {os.path.basename(fpath)}")
+        continue
+    # Find the @add_start_docstrings decorator before Eagle3_VLImageProcessorFast
+    class_line = "class Eagle3_VLImageProcessorFast("
+    if class_line not in content:
+        print(f"WARN: Eagle3_VLImageProcessorFast class not found in {os.path.basename(fpath)}")
+        continue
+    shim = (
+        "\n" + SHIM_MARKER + "\n"
+        "from transformers.image_processing_utils_fast import BaseImageProcessorFast as _BIPF\n"
+        "if not hasattr(_BIPF, '_prepare_input_images') and hasattr(_BIPF, '_prepare_image_like_inputs'):\n"
+        "    _BIPF._prepare_input_images = _BIPF._prepare_image_like_inputs\n\n"
+    )
+    # Insert before @add_start_docstrings decorator (not between decorator and class)
+    idx_class = content.index(class_line)
+    # Search backwards for the decorator
+    decorator_marker = "@add_start_docstrings("
+    idx_dec = content.rfind(decorator_marker, 0, idx_class)
+    insert_idx = idx_dec if idx_dec >= 0 else idx_class
+    content = content[:insert_idx] + shim + content[insert_idx:]
+    with open(fpath, "w") as f:
+        f.write(content)
+    print(f"Patched _prepare_input_images shim: {fpath}")
 PYEOF
 export GROOT_MODULES_DIR HF_EAGLE_CACHE
 
