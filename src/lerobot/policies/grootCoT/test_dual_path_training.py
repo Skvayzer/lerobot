@@ -46,6 +46,8 @@ def make_synthetic_batch(
     # Process each sample through the VLM processor individually
     all_pixel_values = []
     all_grid_thw = []
+    all_input_ids = []
+    all_attention_mask = []
     for sample_images in images_per_sample:
         from PIL import Image
         pil_images = [Image.fromarray(img) for img in sample_images]
@@ -63,29 +65,34 @@ def make_synthetic_batch(
         )
         all_pixel_values.append(proc_out["pixel_values"])  # (total_tokens, patch_dim)
         all_grid_thw.append(proc_out["image_grid_thw"])    # (num_imgs, 3)
+        all_input_ids.append(proc_out["input_ids"].squeeze(0))  # (seq_len,)
+        all_attention_mask.append(proc_out["attention_mask"].squeeze(0))
 
     # Check all samples have the same shape (they should with same-sized images)
     pv_shapes = [pv.shape for pv in all_pixel_values]
     grid_shapes = [g.shape for g in all_grid_thw]
     print(f"[TEST] pixel_values shapes per sample: {pv_shapes}")
     print(f"[TEST] image_grid_thw shapes per sample: {grid_shapes}")
+    print(f"[TEST] input_ids shapes per sample: {[ids.shape for ids in all_input_ids]}")
 
     # Stack into batch: after collation these would be (B, num_imgs, ...)
     # pixel_values: (total_tokens_per_sample, patch_dim) -> stack to (B, tokens, dim)
-    pixel_values = torch.stack(all_pixel_values, dim=0).squeeze(1)  # Remove proc batch dim
-    # If they come out as (1, tokens, dim) from processor, stack gives (B, 1, tokens, dim)
-    # We want (B, tokens, dim) flat per sample
+    pixel_values = torch.stack(all_pixel_values, dim=0).squeeze(1)
     if pixel_values.dim() == 4:
         pixel_values = pixel_values.squeeze(1)
     image_grid_thw = torch.stack(all_grid_thw, dim=0)  # (B, num_imgs, 3)
 
+    # Pad input_ids and attention_mask to same length across batch
+    max_seq_len = max(ids.shape[0] for ids in all_input_ids)
+    padded_ids = torch.zeros(batch_size, max_seq_len, dtype=torch.long)
+    padded_mask = torch.zeros(batch_size, max_seq_len, dtype=torch.long)
+    for i, (ids, mask) in enumerate(zip(all_input_ids, all_attention_mask)):
+        padded_ids[i, :ids.shape[0]] = ids
+        padded_mask[i, :mask.shape[0]] = mask
+
     print(f"[TEST] Batched pixel_values: {pixel_values.shape}")
     print(f"[TEST] Batched image_grid_thw: {image_grid_thw.shape}")
-
-    # Minimal text tokens (just enough to not crash)
-    # Use a simple prompt tokenized
-    input_ids = torch.ones(batch_size, 10, dtype=torch.long)
-    attention_mask = torch.ones(batch_size, 10, dtype=torch.long)
+    print(f"[TEST] Batched input_ids: {padded_ids.shape}")
 
     # State, action, masks
     # GR00T model uses its own action_dim (from pretrained config), not max_action_dim.
@@ -104,8 +111,8 @@ def make_synthetic_batch(
     batch = {
         "qwen_pixel_values": pixel_values.to(device),
         "qwen_image_grid_thw": image_grid_thw.to(device),
-        "qwen_input_ids": input_ids.to(device),
-        "qwen_attention_mask": attention_mask.to(device),
+        "qwen_input_ids": padded_ids.to(device),
+        "qwen_attention_mask": padded_mask.to(device),
         "state": state,
         "state_mask": state_mask,
         "action": action,
