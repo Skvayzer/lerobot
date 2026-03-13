@@ -254,6 +254,33 @@ class LeRobotDatasetMetadata:
         self.metadata_buffer: list[dict] = []
         self.metadata_buffer_size = metadata_buffer_size
 
+        # Guard: detect when root is a parent cache directory instead of dataset-specific.
+        # If root/meta/info.json exists AND root/repo_id/meta/info.json also exists, the
+        # caller almost certainly passed the parent cache dir by mistake (e.g. HF_LEROBOT_HOME
+        # instead of HF_LEROBOT_HOME/org/dataset).  This causes silent data corruption because
+        # the stale meta/ at the parent level is loaded instead of the correct dataset meta/.
+        _dataset_specific = self.root / repo_id / "meta" / "info.json"
+        _root_level_meta = self.root / "meta" / "info.json"
+        if _root_level_meta.exists() and _dataset_specific.exists():
+            raise ValueError(
+                f"Ambiguous dataset root: '{self.root}' contains both meta/info.json AND "
+                f"{repo_id}/meta/info.json. This usually means root was set to the parent "
+                f"cache directory instead of the dataset-specific directory. "
+                f"Set root='{self.root / repo_id}' or omit root entirely."
+            )
+        # Also warn if root doesn't end with the repo_id path and a dataset-specific dir exists
+        if (
+            root is not None
+            and not str(self.root).endswith(repo_id)
+            and _dataset_specific.exists()
+        ):
+            logging.warning(
+                "Dataset root '%s' does not end with repo_id '%s', but a dataset-specific "
+                "directory exists at '%s'. You may be loading stale metadata from the wrong "
+                "location. Consider setting root='%s' or omitting root.",
+                self.root, repo_id, _dataset_specific.parent, self.root / repo_id,
+            )
+
         try:
             if force_cache_sync:
                 raise FileNotFoundError
@@ -339,6 +366,34 @@ class LeRobotDatasetMetadata:
         self.subtasks = load_subtasks(self.root)
         self.episodes = load_episodes(self.root)
         self.stats = load_stats(self.root)
+
+        # Cross-validate: stats dimensions must match feature shapes declared in info.json.
+        # This catches stale meta/ directories or root path misconfigurations that silently
+        # load wrong-dimensional stats (e.g. 28-dim dex3 stats for a 16-dim dex1 dataset).
+        if self.stats is not None:
+            features = self.info.get("features", {})
+            for key in ("action", "observation.state"):
+                if key not in self.stats or key not in features:
+                    continue
+                stat_entry = self.stats[key]
+                expected_shape = tuple(features[key].get("shape", ()))
+                if not expected_shape:
+                    continue
+                expected_dim = expected_shape[0]
+                for stat_name in ("min", "max", "mean", "std"):
+                    if stat_name not in stat_entry:
+                        continue
+                    stat_val = stat_entry[stat_name]
+                    stat_dim = stat_val.shape[0] if hasattr(stat_val, "shape") else len(stat_val)
+                    if stat_dim != expected_dim:
+                        raise ValueError(
+                            f"Stats dimension mismatch for '{key}.{stat_name}': stats have "
+                            f"dim={stat_dim} but info.json declares shape={expected_shape} "
+                            f"(expected dim={expected_dim}). This likely means the meta/ "
+                            f"directory at '{self.root}' contains stale stats from a "
+                            f"different dataset. Check --dataset.root or remove the stale "
+                            f"meta/ directory."
+                        )
 
     def pull_from_repo(
         self,

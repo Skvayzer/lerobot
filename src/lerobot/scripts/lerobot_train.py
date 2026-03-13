@@ -13,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import copy
 import dataclasses
 import json
 import logging
@@ -59,6 +60,7 @@ from lerobot.utils.train_utils import (
     reinject_dataset_stats,
     save_checkpoint,
     update_last_checkpoint,
+    validate_dataset_stats,
 )
 from lerobot.utils.utils import (
     format_big_number,
@@ -883,6 +885,15 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     if not is_main_process:
         dataset = make_dataset(cfg)
 
+    # Snapshot dataset stats IMMEDIATELY after loading, before anything can mutate them.
+    # This prevents bugs where make_policy() or processor creation modifies stats in-place.
+    _frozen_dataset_stats = copy.deepcopy(dataset.meta.stats)
+
+    # Validate stats dimensions match dataset features — catches stale meta/ directories
+    # or wrong --dataset.root before any training happens.
+    if _frozen_dataset_stats is not None:
+        validate_dataset_stats(_frozen_dataset_stats, dataset.meta.info)
+
     resolved_steps, effective_batch_size = _resolve_total_training_steps(
         cfg,
         dataset_num_frames=int(dataset.num_frames),
@@ -921,7 +932,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     postprocessor_kwargs = {}
     if (cfg.policy.pretrained_path and not cfg.resume) or not cfg.policy.pretrained_path:
         # Only provide dataset_stats when not resuming from saved processor state
-        processor_kwargs["dataset_stats"] = dataset.meta.stats
+        processor_kwargs["dataset_stats"] = _frozen_dataset_stats
 
     # For SARM, always provide dataset_meta for progress normalization
     if cfg.policy.type == "sarm":
@@ -931,7 +942,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         processor_kwargs["preprocessor_overrides"] = {
             "device_processor": {"device": device.type},
             "normalizer_processor": {
-                "stats": dataset.meta.stats,
+                "stats": _frozen_dataset_stats,
                 "features": {**policy.config.input_features, **policy.config.output_features},
                 "norm_map": policy.config.normalization_mapping,
             },
@@ -941,7 +952,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         }
         postprocessor_kwargs["postprocessor_overrides"] = {
             "unnormalizer_processor": {
-                "stats": dataset.meta.stats,
+                "stats": _frozen_dataset_stats,
                 "features": policy.config.output_features,
                 "norm_map": policy.config.normalization_mapping,
             },
@@ -957,7 +968,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     # Ensure processor steps have the correct dataset stats immediately after creation.
     # This guards against code-path bugs where stats from a base model or stale checkpoint
     # end up in the processor instead of the actual training dataset stats.
-    reinject_dataset_stats(preprocessor, postprocessor, dataset.meta.stats)
+    reinject_dataset_stats(preprocessor, postprocessor, _frozen_dataset_stats)
 
     recap_indicator_lookup: dict[int, float] | None = None
     recap_indicator_key = str(getattr(cfg.policy, "recap_adv_indicator_key", "observation.extra.adv_indicator"))
@@ -1207,7 +1218,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             if is_main_process:
                 logging.info(f"Checkpoint policy after step {step}")
                 # Defensively re-inject dataset stats to prevent normalization mismatch
-                reinject_dataset_stats(preprocessor, postprocessor, dataset.meta.stats)
+                reinject_dataset_stats(preprocessor, postprocessor, _frozen_dataset_stats)
                 checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
                 save_checkpoint(
                     checkpoint_dir=checkpoint_dir,

@@ -91,6 +91,44 @@ def prune_old_checkpoints(checkpoints_dir: Path, keep_last_n: int | None) -> lis
     return to_remove
 
 
+def _get_stat_dim(stat_value) -> int:
+    """Get the first dimension of a stats value (numpy array, tensor, or list)."""
+    import numpy as np
+    import torch
+
+    if isinstance(stat_value, (np.ndarray, torch.Tensor)):
+        return stat_value.shape[0]
+    return len(stat_value)
+
+
+def validate_dataset_stats(dataset_stats: dict, dataset_info: dict) -> None:
+    """Validate that dataset stats dimensions match the feature shapes in info.json.
+
+    Raises ValueError if a mismatch is detected, preventing silent training on
+    wrong normalization stats (e.g. stale meta/ from a different end-effector).
+    """
+    features = dataset_info.get("features", {})
+    for key in ("action", "observation.state"):
+        if key not in dataset_stats or key not in features:
+            continue
+        expected_shape = tuple(features[key].get("shape", ()))
+        if not expected_shape:
+            continue
+        expected_dim = expected_shape[0]
+        stat_entry = dataset_stats[key]
+        for stat_name in ("min", "max", "mean", "std"):
+            if stat_name not in stat_entry:
+                continue
+            stat_dim = _get_stat_dim(stat_entry[stat_name])
+            if stat_dim != expected_dim:
+                raise ValueError(
+                    f"Stats/features dimension mismatch for '{key}.{stat_name}': "
+                    f"stats dim={stat_dim}, info.json shape={expected_shape} "
+                    f"(expected dim={expected_dim}). This likely means metadata was "
+                    f"loaded from the wrong location (stale meta/ directory)."
+                )
+
+
 def reinject_dataset_stats(
     preprocessor: PolicyProcessorPipeline | None,
     postprocessor: PolicyProcessorPipeline | None,
@@ -110,17 +148,25 @@ def reinject_dataset_stats(
             continue
         for step in pipeline.steps:
             if hasattr(step, "stats") and hasattr(step, "normalize_min_max"):
+                # Before overwriting, check if existing stats have different dimensions
+                # (indicates a potential dataset/model mismatch)
+                if step.stats is not None:
+                    old_action = step.stats.get("action", {}).get("min")
+                    new_action = dataset_stats.get("action", {}).get("min")
+                    if old_action is not None and new_action is not None:
+                        old_dim = _get_stat_dim(old_action)
+                        new_dim = _get_stat_dim(new_action)
+                        if old_dim != new_dim:
+                            logging.warning(
+                                "reinject_dataset_stats: %s had action dim=%d, "
+                                "overwriting with dim=%d from dataset. This dimension "
+                                "change may indicate a dataset/end-effector mismatch.",
+                                type(step).__name__, old_dim, new_dim,
+                            )
                 step.stats = dataset_stats
-                # Validate: check action dim matches
                 new_action = dataset_stats.get("action", {}).get("min")
                 if new_action is not None:
-                    import numpy as np
-                    import torch
-
-                    if isinstance(new_action, (np.ndarray, torch.Tensor)):
-                        new_dim = new_action.shape[0] if hasattr(new_action, "shape") else len(new_action)
-                    else:
-                        new_dim = len(new_action)
+                    new_dim = _get_stat_dim(new_action)
                     logging.info(
                         "reinject_dataset_stats: set %s.stats action dim=%d (count=%s)",
                         type(step).__name__,
