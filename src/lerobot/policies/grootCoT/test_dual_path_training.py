@@ -99,7 +99,7 @@ def make_synthetic_batch(
     groot_action_dim = model._groot_model.action_dim
     groot_action_horizon = model._groot_model.action_horizon
     max_state = model.config.max_state_dim
-    state = torch.randn(batch_size, max_state, device=device)
+    state = torch.randn(batch_size, 1, max_state, device=device)
     state_mask = torch.zeros(batch_size, max_state, dtype=torch.bool, device=device)
     state_mask[:, :state_dim] = True
     action = torch.randn(batch_size, groot_action_horizon, groot_action_dim, device=device)
