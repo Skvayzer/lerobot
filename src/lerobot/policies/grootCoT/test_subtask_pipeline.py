@@ -129,14 +129,12 @@ def test_processor_language_override():
     import numpy as np
     from lerobot.policies.grootCoT.processor_groot import GrootPackInputsStep
 
-    # Create a minimal processor step
+    # Create a minimal processor step (dataclass, uses field defaults)
     step = GrootPackInputsStep(
         max_state_dim=64,
         max_action_dim=32,
         action_horizon=16,
-        video_height=480,
-        video_width=640,
-        camera_names=["front"],
+        enforce_dex3_canonical_camera_order=False,
     )
 
     # Build a minimal transition dict
