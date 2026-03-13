@@ -39,19 +39,21 @@ export TOKENIZERS_PARALLELISM=false
 export HF_HUB_DISABLE_XET=1
 export HF_HUB_ENABLE_HF_TRANSFER=0
 
-# Ensure transformers >= 4.55 for Eagle2.5 fast processor and Qwen3-VL support
+# Ensure transformers >= 4.57 for native Qwen3-VL support.
+# Eagle2.5 imports are lazy (only loaded by EagleBackbone, not CraftNet/QwenBackbone),
+# so the removal of group_images_by_shape in transformers >= 4.56 does not affect us.
 CURRENT_TF=$(python -c "import transformers; print(transformers.__version__)" 2>/dev/null)
 echo "Current transformers: $CURRENT_TF"
 if python -c "
 import transformers
 from packaging.version import Version
 v = Version(transformers.__version__)
-exit(0 if v >= Version('4.55.0') else 1)
+exit(0 if v >= Version('4.57.0') else 1)
 " 2>/dev/null; then
-    echo "transformers >= 4.55.0, OK"
+    echo "transformers >= 4.57.0, OK"
 else
-    echo "Installing transformers>=4.55.0 (current: $CURRENT_TF) ..."
-    pip install 'transformers>=4.55.0' 2>&1 | tail -5
+    echo "Installing transformers>=4.57.0 (current: $CURRENT_TF) ..."
+    pip install 'transformers>=4.57.0' 2>&1 | tail -5
     echo "transformers now: $(python -c 'import transformers; print(transformers.__version__)')"
 fi
 

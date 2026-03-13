@@ -67,7 +67,6 @@ from lerobot.policies.grootCoT.action_head.flow_matching_action_head import (
     FlowmatchingActionHeadConfig,
 )
 from lerobot.policies.grootCoT.system2_vlm_registry import DEFAULT_SYSTEM2_VLM_MODEL_ID
-from lerobot.policies.groot.utils import ensure_eagle_cache_ready
 from lerobot.utils.constants import HF_LEROBOT_HOME
 
 # Monkey-patch torch.linspace to handle Tensor 'steps' argument.
@@ -981,6 +980,11 @@ class EagleBackbone(nn.Module):
         assert not reproject_vision, "Reproject vision is not implemented here, set to False"
 
         # Prefer loading Eagle model config from the cache directory where vendor files were copied.
+        # Import lazily — Eagle utilities pull in eagle2_hg_model which requires
+        # transformers <= 4.55 (group_images_by_shape).  CraftNet never instantiates
+        # EagleBackbone, so the import only runs when actually needed.
+        from lerobot.policies.groot.utils import ensure_eagle_cache_ready
+
         vendor_dir = DEFAULT_VENDOR_EAGLE_PATH
         cache_dir = HF_LEROBOT_HOME / tokenizer_assets_repo
         try:

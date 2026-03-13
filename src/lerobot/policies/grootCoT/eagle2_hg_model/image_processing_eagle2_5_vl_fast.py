@@ -12,12 +12,27 @@ from transformers.image_processing_utils import (
     BatchFeature,
     get_patch_output_size,
 )
-from transformers.image_processing_utils_fast import (
-    BaseImageProcessorFast,
-    DefaultFastImageProcessorKwargs,
-    group_images_by_shape,
-    reorder_images,
-)
+try:
+    from transformers.image_processing_utils_fast import (
+        BaseImageProcessorFast,
+        DefaultFastImageProcessorKwargs,
+        group_images_by_shape,
+        reorder_images,
+    )
+except ImportError:
+    # transformers >= 4.56 removed group_images_by_shape / reorder_images.
+    # This module is only used by EagleBackbone; CraftNet (QwenBackbone) never
+    # imports it, so set to None and raise at call-site if actually needed.
+    group_images_by_shape = None
+    reorder_images = None
+    try:
+        from transformers.image_processing_utils_fast import (
+            BaseImageProcessorFast,
+            DefaultFastImageProcessorKwargs,
+        )
+    except ImportError:
+        BaseImageProcessorFast = None
+        DefaultFastImageProcessorKwargs = None
 from transformers.image_utils import (
     IMAGENET_STANDARD_MEAN,  # 0.5, 0.5, 0.5
     IMAGENET_STANDARD_STD,  # 0.5, 0.5, 0.5
