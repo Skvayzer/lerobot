@@ -250,7 +250,7 @@ accelerate launch \\
   --policy.max_state_dim=64 \\
   --policy.max_action_dim=32 \\
   --dataset.repo_id=unitreerobotics/G1_Dex3_BlockStacking_Dataset \\
-  --dataset.root=${HF_LEROBOT_HOME} \\
+  --dataset.root=${HF_LEROBOT_HOME}/unitreerobotics/G1_Dex3_BlockStacking_Dataset \\
   '--dataset.robot_types=["g1"]' \\
   --dataset.video_backend=pyav \\
   --tolerance_s=5e-4 \\
