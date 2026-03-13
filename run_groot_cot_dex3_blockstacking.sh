@@ -124,6 +124,7 @@ python -c "
 import torch
 from lerobot.policies.grootCoT.configuration_groot import GrootCoTConfig
 from lerobot.policies.grootCoT.modeling_groot import GrootCoTPolicy
+from lerobot.configs.types import FeatureType, PolicyFeature
 
 # Create config matching training settings
 config = GrootCoTConfig(
@@ -136,6 +137,14 @@ config = GrootCoTConfig(
     tune_projector=True,
     tune_vlm_projector=True,
     visual_dropout_p=0.2,
+    input_features={
+        'observation.images.cam_left_high': PolicyFeature(type=FeatureType.VISUAL, shape=(3, 480, 640)),
+        'observation.images.cam_right_high': PolicyFeature(type=FeatureType.VISUAL, shape=(3, 480, 640)),
+        'observation.state': PolicyFeature(type=FeatureType.STATE, shape=(29,)),
+    },
+    output_features={
+        'action': PolicyFeature(type=FeatureType.ACTION, shape=(29,)),
+    },
 )
 
 # Verify dual-rate training path is enabled
