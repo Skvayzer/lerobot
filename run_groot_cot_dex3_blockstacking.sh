@@ -72,6 +72,11 @@ export USE_PYTORCH_KERNEL_CACHE=1
 export FLASH_ATTENTION_FORCE_BUILD=0
 export FLASH_ATTENTION_SKIP_CUDA_BUILD=1
 
+# ROCm-specific: force deterministic hipBLAS to prevent NaN from reduction order
+export HIPBLASLT_TUNING_OVERRIDE=NONE
+export HIP_FORCE_DEV_KERNELS=1
+export ROCBLAS_LAYER=0
+
 NUM_GPUS=4
 NUM_NODES=2
 TOTAL_GPUS=$((NUM_GPUS * NUM_NODES))
@@ -208,6 +213,9 @@ export HF_HUB_DISABLE_XET=1
 export HF_HUB_ENABLE_HF_TRANSFER=0
 export FLASH_ATTENTION_FORCE_BUILD=0
 export FLASH_ATTENTION_SKIP_CUDA_BUILD=1
+export HIPBLASLT_TUNING_OVERRIDE=NONE
+export HIP_FORCE_DEV_KERNELS=1
+export ROCBLAS_LAYER=0
 # Per-rank local /tmp caches to avoid cross-node VAST flock (ENOLCK) issues
 RANK_CACHE=/tmp/\${USER}/rocm_cache_${SLURM_JOB_ID}_\${SLURM_PROCID}
 mkdir -p "\${RANK_CACHE}"/{miopen_db,miopen_cache,torch_kernels,xdg_cache,hf_datasets}

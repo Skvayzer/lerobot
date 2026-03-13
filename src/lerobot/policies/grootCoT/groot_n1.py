@@ -170,24 +170,13 @@ class QwenBackbone(nn.Module):
                             self.qwen_model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
         
         print(f"[GROOT] Initialized QwenBackbone with model class: {type(self.qwen_model)}")
-        # AMD ROCm workaround: BF16 precision in the visual encoder (ViT) produces NaN
-        # on gfx90a (MI210) GPUs due to BF16 overflow in attention matmuls.
-        # Cast the visual encoder to FP32 for numerical stability while keeping the
-        # LLM in BF16 for memory efficiency.
-        # Note: check torch.version.hip directly (not torch.cuda.is_available(), which
-        # may return False during distributed init before CUDA is fully set up).
+        # AMD ROCm workaround: BF16 produces NaN in both ViT and LLM layers on MI210.
+        # Cast the ENTIRE model to FP32 for numerical stability.
         _is_rocm = getattr(torch.version, "hip", None) is not None
-        print(f"[GROOT] ROCm check: load_bf16={load_bf16}, hip={getattr(torch.version, chr(39)+chr(104)+chr(105)+chr(112), None)}, _is_rocm={_is_rocm}", flush=True)
+        print(f"[GROOT] ROCm check: load_bf16={load_bf16}, hip={getattr(torch.version, 'hip', None)}, _is_rocm={_is_rocm}", flush=True)
         if _is_rocm:
-            _vit_cast_done = False
-            for _vit_attr in ("visual", "vision_model", "vision_tower", "visual_encoder"):
-                if hasattr(self.qwen_model, _vit_attr):
-                    getattr(self.qwen_model, _vit_attr).float()
-                    print(f"[GROOT] AMD ROCm: cast Qwen3VL .{_vit_attr} to FP32 (hip={torch.version.hip}) to prevent BF16 NaN.", flush=True)
-                    _vit_cast_done = True
-                    break
-            if not _vit_cast_done:
-                print("[GROOT] AMD ROCm: WARNING — could not find visual encoder attr to cast to FP32. NaN may occur.", flush=True)
+            self.qwen_model.float()
+            print(f"[GROOT] AMD ROCm: cast entire Qwen model to FP32 (hip={torch.version.hip}) to prevent BF16 NaN.", flush=True)
         # Diagnostic hook: print ViT output stats for first 3 forward passes
         _hook_calls = [0]
         def _vit_diag_hook(module, inp, out):
@@ -252,7 +241,7 @@ class QwenBackbone(nn.Module):
         else:
             self.projector = nn.Sequential(nn.LayerNorm(hidden_size), nn.Linear(hidden_size, project_to_dim))
             value_input_dim = int(project_to_dim)
-            if load_bf16:
+            if load_bf16 and not _is_rocm:
                 self.projector = self.projector.to(torch.bfloat16)
 
         if self.value_head_enable:
