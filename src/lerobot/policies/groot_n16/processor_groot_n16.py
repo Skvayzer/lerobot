@@ -109,9 +109,9 @@ def make_groot_n16_pre_post_processors(
     7. Move to device
     """
     state_horizon = 1
-    action_horizon = min(config.chunk_size, 16)  # N1.6 max action horizon
-    max_state_dim = config.max_state_dim   # 29
-    max_action_dim = config.max_action_dim  # 29
+    action_horizon = config.chunk_size  # must match checkpoint action_horizon (50 for GR00T-N1.6-3B)
+    max_state_dim = config.max_state_dim
+    max_action_dim = config.max_action_dim
 
     padded_stats = dataset_stats or {}
 
@@ -381,9 +381,15 @@ class GrootN16EagleEncodeStep(ProcessorStep):
 
     Produces 'vlm_content' entries per batch item, which the collate step
     converts to pixel_values/input_ids/attention_mask tensors.
+
+    image_max_pixels: caps image resolution fed to Eagle processor. Training
+    images may be large (e.g. 480x640 = 307K pixels). Siglip2 concatenates all
+    patches from every image in the batch into one sequence before attention, so
+    oversized images → OOM. Default 224*224=50176 keeps patches/GPU manageable.
     """
 
     model_name: str = "nvidia/Eagle-Block2A-2B-v2"
+    image_max_pixels: int = 224 * 224  # ~50K pixels; limits patches per image
     _proc: ProcessorMixin | None = field(default=None, init=False, repr=False)
 
     @property
@@ -419,14 +425,20 @@ class GrootN16EagleEncodeStep(ProcessorStep):
 
             pil_images = [Image.fromarray(flat[i]) for i in range(t * v)]
 
-            # Build conversation in the format N1.6 processor expects
+            # Build conversation in the format N1.6 processor expects.
+            # max_pixels limits image resolution so Eagle's smart_resize keeps
+            # patch count small enough to avoid Siglip2 full-attention OOM
+            # (Siglip2 concatenates ALL batch images into one sequence).
             lang_text = str([lang])  # Match original GR00T format
             conversation = [
                 {
                     "role": "user",
                     "content": [
                         {"type": "text", "text": lang_text},
-                        *[{"type": "image", "image": img} for img in pil_images],
+                        *[
+                            {"type": "image", "image": img, "max_pixels": self.image_max_pixels}
+                            for img in pil_images
+                        ],
                     ],
                 }
             ]
