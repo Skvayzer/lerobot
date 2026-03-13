@@ -88,14 +88,17 @@ def make_synthetic_batch(
     attention_mask = torch.ones(batch_size, 10, dtype=torch.long)
 
     # State, action, masks
+    # GR00T model uses its own action_dim (from pretrained config), not max_action_dim.
+    groot_action_dim = model._groot_model.action_dim
+    groot_action_horizon = model._groot_model.action_horizon
     max_state = model.config.max_state_dim
-    max_action = model.config.max_action_dim
     state = torch.randn(batch_size, max_state, device=device)
     state_mask = torch.zeros(batch_size, max_state, dtype=torch.bool, device=device)
     state_mask[:, :state_dim] = True
-    action = torch.randn(batch_size, action_horizon, max_action, device=device)
-    action_mask = torch.zeros(batch_size, max_action, dtype=torch.bool, device=device)
+    action = torch.randn(batch_size, groot_action_horizon, groot_action_dim, device=device)
+    action_mask = torch.zeros(batch_size, groot_action_dim, dtype=torch.bool, device=device)
     action_mask[:, :action_dim] = True
+    print(f"[TEST] Using groot action_dim={groot_action_dim}, horizon={groot_action_horizon}")
     embodiment_id = torch.zeros(batch_size, dtype=torch.long, device=device)
 
     batch = {
