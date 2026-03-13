@@ -109,6 +109,8 @@ class QwenBackbone(nn.Module):
         **_: dict,
     ):
         super().__init__()
+        self.model_id = model_id
+        self._model_id_lower = model_id.lower()
         self.input_prefix = input_prefix
         self.legacy_input_prefix = (
             LEGACY_EAGLE_INPUT_PREFIX
@@ -900,13 +902,19 @@ class QwenBackbone(nn.Module):
         )
 
         # User suffix (after vision tokens): \n{user_msg}<|im_end|>\n<|im_start|>assistant\n
+        # For Thinking models: pre-fill <think>\n\n</think>\n to skip internal
+        # reasoning and go directly to structured JSON output.
+        _is_thinking = "thinking" in getattr(self, "_model_id_lower", str(getattr(self, "model_id", "")).lower())
+        assistant_suffix = tok.encode("assistant\n", add_special_tokens=False)
+        if _is_thinking:
+            assistant_suffix += tok.encode("<think>\n\n</think>\n", add_special_tokens=False)
         user_suffix = (
             _nl
             + _encode(user_text)
             + [im_end_id]
             + _nl
             + [im_start_id]
-            + tok.encode("assistant\n", add_special_tokens=False)
+            + assistant_suffix
         )
 
         # Stitch: sys_prefix + ids[0 : last_ve+1] + user_suffix
@@ -1741,12 +1749,13 @@ class GR00TN15(PreTrainedModel):
             _vit_proj = getattr(getattr(_vit, "patch_embed", None), "proj", None) if _vit else None
             if _vit_proj is not None:
                 _w_max = _vit_proj.weight.float().abs().max().item()
-                print(f"[GROOT] ViT proj weight check: max={_w_max:.4g} (expected <1.0)", flush=True)
-                if _w_max > 10.0:
+                print(f"[GROOT] ViT proj weight check: max={_w_max:.4g} (expected 0.001–1.0)", flush=True)
+                if _w_max > 10.0 or _w_max < 1e-6:
                     # Weights are uninitialized garbage — reload in-place from Qwen checkpoint
                     _backbone_cfg = getattr(pretrained_model.config, "backbone_cfg", {})
                     _model_id = _backbone_cfg.get("model_id", "Qwen/Qwen3-VL-8B-Instruct")
-                    print(f"[GROOT] Corrupted ViT weights detected (max={_w_max:.4g}). In-place reload from {_model_id}...", flush=True)
+                    _reason = "zeroed out" if _w_max < 1e-6 else "uninitialized garbage"
+                    print(f"[GROOT] Corrupted ViT weights detected ({_reason}, max={_w_max:.4g}). In-place reload from {_model_id}...", flush=True)
                     import gc
                     _is_rocm_fix = getattr(torch.version, "hip", None) is not None
                     _fix_load_kw = {

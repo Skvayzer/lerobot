@@ -58,8 +58,11 @@ Rules:
 3. RECAP labels are mandatory every call: recap.reward_label.r_t, recap.value_target.v_hat, recap.advantage.indicator_I.
 4. indicator_I must be exactly "POS", "NEG", or "DROPPED". Set "DROPPED" with ~30% probability to simulate dropout.
 5. Estimate v_hat as -(remaining_steps_estimate) / max_episode_steps, clipped to [-1, 0].
-6. next.system1_subtask_text must be a short imperative instruction (≤15 words) for the low-level action policy.
-7. next.target_bbox is optional: [x1, y1, x2, y2] in normalised 0-1 image coordinates for the target object. Include it when a specific object should be grounded visually."""
+6. next.system1_subtask_text must be a short imperative instruction (≤15 words) for the low-level action policy. Examples: "grasp the red block with right hand", "place shaft into base hole", "release and retract right hand".
+7. next.target_bbox is [x1, y1, x2, y2] in normalised 0-1 image coordinates for the target object, where (0,0) is top-left and (1,1) is bottom-right. Look at the image carefully and provide precise coordinates. Include whenever a specific object is involved.
+
+Minimal example of the "next" block:
+{"next": {"decision": "continue", "system1_subtask_text": "grasp the red block with right hand", "target_bbox": [0.55, 0.40, 0.68, 0.55], "expected_horizon_steps": 30}}"""
 
 # ---------------------------------------------------------------------------
 # Prompt builders
@@ -201,6 +204,11 @@ def parse_cot_json(raw_text: str) -> tuple[dict | None, str | None]:
         return None, "empty output"
 
     text = raw_text.strip()
+
+    # Strategy 0: strip <think>...</think> tags (Qwen3-VL-Thinking variant)
+    think_match = re.search(r"</think>\s*", text)
+    if think_match:
+        text = text[think_match.end():].strip()
 
     # Strategy 1: direct parse
     try:
