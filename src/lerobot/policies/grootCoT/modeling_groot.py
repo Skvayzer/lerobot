@@ -221,7 +221,12 @@ class GrootCoTPolicy(PreTrainedPolicy):
 
     @staticmethod
     def _build_groot_inputs(batch: dict[str, Tensor], include_action: bool) -> dict[str, Tensor]:
-        """Filter a preprocessed batch to keys consumed by GR00T."""
+        """Filter a preprocessed batch to keys consumed by GR00T.
+
+        NOTE: qwen_pixel_values and qwen_image_grid_thw are consumed by both
+        run_backbone (full Qwen forward) and run_visual_only (ViT-only fast path).
+        These keys must not be stripped by any intermediate processing step.
+        """
         allowed_base = {"state", "state_mask", "embodiment_id"}
         if include_action:
             allowed_base.update({"action", "action_mask"})
@@ -635,6 +640,26 @@ class GrootCoTPolicy(PreTrainedPolicy):
             return backbone_outputs
         return self._clone_batch_feature(self._cached_train_backbone_outputs)  # type: ignore[arg-type]
 
+    _system1_visual_source_warned: bool = False
+
+    def _get_fresh_visual_features(self, groot_inputs: dict[str, Tensor]) -> Tensor | None:
+        """Run ViT-only fast path if backbone supports it. Returns projected visual tokens or None."""
+        if not hasattr(self._groot_model, "run_visual_only"):
+            return None
+        from lerobot.policies.grootCoT.groot_n1 import QwenBackbone
+        if not isinstance(self._groot_model.backbone, QwenBackbone):
+            return None
+        source = getattr(self.config, "system1_visual_source", "vit")
+        if source != "vit":
+            if not self._system1_visual_source_warned:
+                print(
+                    f"[GROOT] system1_visual_source='{source}' is not yet implemented; "
+                    f"falling back to 'vit' (pure ViT output)."
+                )
+                self._system1_visual_source_warned = True
+        visual_output = self._groot_model.run_visual_only(groot_inputs)
+        return visual_output.get("visual_features")
+
     def _predict_action_chunk_from_inputs(
         self,
         *,
@@ -650,6 +675,9 @@ class GrootCoTPolicy(PreTrainedPolicy):
         )
 
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=self.config.use_bf16):
+            # System 1 visual features: always fresh from current camera frame
+            fresh_visual = self._get_fresh_visual_features(groot_inputs)
+
             if not use_cfg:
                 if self._dual_rate_enabled() and use_cached_dual_rate:
                     backbone_outputs = self._get_backbone_outputs_for_inference(
@@ -662,6 +690,7 @@ class GrootCoTPolicy(PreTrainedPolicy):
                         inputs=groot_inputs,
                         backbone_outputs=backbone_outputs,
                         is_training=False,
+                        fresh_visual_features=fresh_visual,
                     )
                 elif self._dual_rate_enabled():
                     backbone_outputs = self._groot_model.run_backbone(groot_inputs)
@@ -669,6 +698,7 @@ class GrootCoTPolicy(PreTrainedPolicy):
                         inputs=groot_inputs,
                         backbone_outputs=backbone_outputs,
                         is_training=False,
+                        fresh_visual_features=fresh_visual,
                     )
                 else:
                     outputs = self._groot_model.get_action(groot_inputs)
@@ -697,11 +727,13 @@ class GrootCoTPolicy(PreTrainedPolicy):
                     inputs=cond_inputs,
                     backbone_outputs=self._clone_batch_feature(backbone_outputs),
                     is_training=False,
+                    fresh_visual_features=fresh_visual,
                 )
                 uncond_outputs = self._groot_model.run_action_head(
                     inputs=uncond_inputs,
                     backbone_outputs=self._clone_batch_feature(backbone_outputs),
                     is_training=False,
+                    fresh_visual_features=fresh_visual,
                 )
                 actions = apply_cfg_guidance_velocity(
                     cond_outputs.get("action_pred"),
@@ -778,10 +810,19 @@ class GrootCoTPolicy(PreTrainedPolicy):
                     groot_inputs,
                     force_refresh=force_refresh,
                 )
+                # Extract visual_features captured by ViT hook during backbone forward
+                fresh_visual = backbone_outputs.get("visual_features")
+                # Visual feature dropout: randomly zero fresh features to teach the
+                # DiT to function with cached System 2 features alone.
+                if fresh_visual is not None and self.training:
+                    dropout_p = getattr(self.config, "visual_dropout_p", 0.2)
+                    if dropout_p > 0 and torch.rand(1).item() < dropout_p:
+                        fresh_visual = torch.zeros_like(fresh_visual)
                 outputs = self._groot_model.run_action_head(
                     inputs=groot_inputs,
                     backbone_outputs=backbone_outputs,
                     is_training=True,
+                    fresh_visual_features=fresh_visual,
                 )
             else:
                 outputs = self._groot_model.forward(groot_inputs)
@@ -884,6 +925,28 @@ class GrootCoTPolicy(PreTrainedPolicy):
             self._last_replan_step = self._inference_step
 
         if len(self._action_queue) > 0:
+            action = self._action_queue.popleft()
+        elif self._cached_backbone_outputs is not None:
+            # System 1 fast-visual path: generate actions using cached System 2
+            # backbone features + fresh ViT features from the current camera frame.
+            # This fills the gap between System 2 updates with reactive actions.
+            device = next(self.parameters()).device
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=self.config.use_bf16):
+                fresh_visual = self._get_fresh_visual_features(groot_inputs)
+                backbone_clone = self._clone_batch_feature(self._cached_backbone_outputs)
+                outputs = self._groot_model.run_action_head(
+                    inputs=groot_inputs,
+                    backbone_outputs=backbone_clone,
+                    is_training=False,
+                    fresh_visual_features=fresh_visual,
+                )
+            actions = outputs.get("action_pred")
+            original_action_dim = self.config.output_features["action"].shape[0]
+            actions = actions[:, :, :original_action_dim]
+            action_chunk = actions.transpose(0, 1).detach().clone()
+            self._action_queue.clear()
+            self._action_queue.extend(action_chunk)
+            self._last_replan_step = self._inference_step
             action = self._action_queue.popleft()
         else:
             action = self._state_based_fallback_action(batch)

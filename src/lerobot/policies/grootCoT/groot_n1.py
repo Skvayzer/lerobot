@@ -198,6 +198,26 @@ class QwenBackbone(nn.Module):
             if hasattr(self.qwen_model, _vit_attr2):
                 getattr(self.qwen_model, _vit_attr2).register_forward_hook(_vit_diag_hook)
                 break
+
+        # Hook to capture ViT output during full forward pass.
+        # _in_visual_only_mode prevents the hook from overwriting cached output
+        # when forward_visual_only calls the ViT independently.
+        self._cached_vit_output = None
+        self._in_visual_only_mode = False
+
+        def _capture_vit_output(module, inp, out):
+            if self._in_visual_only_mode:
+                return
+            # Unwrap tuple outputs (some Qwen versions return (hidden_states, ...))
+            x = out[0] if isinstance(out, (tuple, list)) else out
+            # Keep gradient path during training; detach for inference
+            self._cached_vit_output = x.detach() if not self.training else x
+
+        for _attr in ("visual", "vision_model", "vision_tower", "visual_encoder"):
+            if hasattr(self.qwen_model, _attr):
+                getattr(self.qwen_model, _attr).register_forward_hook(_capture_vit_output)
+                break
+
         try:
             self._tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
         except Exception as exc:
@@ -215,18 +235,11 @@ class QwenBackbone(nn.Module):
 
         self.select_layer = select_layer
         if self.select_layer is None and num_layers is not None:
-            # Middle layer (skip embeddings at index 0) to retain visual info
-            self.select_layer = min(max(1, 1 + num_layers // 2), num_layers)
-
-        # Truncate layers to save compute and memory (matching original Groot implementation)
-        if self.select_layer is not None and num_layers is not None:
-             # Qwen2/3-VL structure: qwen_model.model.layers
-             if hasattr(self.qwen_model, "model") and hasattr(self.qwen_model.model, "layers"):
-                 layers = self.qwen_model.model.layers
-                 while len(layers) > self.select_layer:
-                     # Remove the last layer until we match select_layer
-                     layers.pop(-1)
-                 print(f"Truncated Qwen backbone to {len(layers)} layers (select_layer={self.select_layer})")
+            # Late layer for maximum semantic richness (System 2 features).
+            # Layer 28 of 32: deep enough for full reasoning, avoids final-layer
+            # next-token-prediction bias. Spatial precision is handled separately
+            # by System 1's fast ViT path (forward_visual_only).
+            self.select_layer = max(1, num_layers - 3)
 
         if project_to_dim is None:
             self.projector = nn.Identity()
@@ -399,7 +412,7 @@ class QwenBackbone(nn.Module):
 
     def _select_hidden(self, hidden_states: tuple[torch.Tensor, ...]) -> torch.Tensor:
         if self.select_layer is None:
-            idx = len(hidden_states) // 2
+            idx = len(hidden_states) - 4
         else:
             idx = self.select_layer
             if idx < 0:
@@ -511,6 +524,86 @@ class QwenBackbone(nn.Module):
         qwen_features = self.projector(qwen_features)
         return qwen_features, qwen_mask
 
+    def forward_visual_only(self, vl_input: BatchFeature) -> torch.Tensor:
+        """Fast path: extract visual features from ViT only, bypassing all LLM layers.
+
+        Used by System 1 at ~10 Hz for fresh spatial information.
+        Returns projected visual tokens shaped (B, patches_per_sample, proj_dim).
+        """
+        qwen_input, _ = self._collect_prefixed_inputs(vl_input)
+        if not qwen_input:
+            raise ValueError(
+                "No multimodal input keys found for visual-only forward. "
+                f"Expected prefix '{self.input_prefix}' or legacy '{self.legacy_input_prefix}'."
+            )
+
+        pixel_values = qwen_input.get("pixel_values")
+        image_grid_thw = qwen_input.get("image_grid_thw")
+
+        if pixel_values is None:
+            raise ValueError("pixel_values required for forward_visual_only")
+
+        # Remember pre-flatten shape to infer batch grouping later.
+        # After collation, image_grid_thw is (B, num_imgs_per_sample, 3).
+        # Qwen expects it flattened to (total_imgs, 3).
+        grid_was_3d = image_grid_thw is not None and image_grid_thw.dim() == 3
+        batch_size = image_grid_thw.shape[0] if grid_was_3d else 1
+        imgs_per_sample = image_grid_thw.shape[1] if grid_was_3d else (
+            image_grid_thw.shape[0] if image_grid_thw is not None else 0
+        )
+        if grid_was_3d:
+            image_grid_thw = image_grid_thw.flatten(0, 1)
+
+        # Call the ViT directly — Qwen3VL's visual encoder takes
+        # (hidden_states, grid_thw) where hidden_states is raw pixel_values
+        # (patch_embed is applied internally as the first op in visual.forward).
+        # Guard flag prevents the capture hook from overwriting _cached_vit_output.
+        vit = self.qwen_model.visual
+        pixel_values = pixel_values.type(vit.dtype)
+        self._in_visual_only_mode = True
+        try:
+            visual_tokens = vit(pixel_values, grid_thw=image_grid_thw)
+        finally:
+            self._in_visual_only_mode = False
+
+        # Unwrap tuple output if needed (some Qwen versions)
+        if isinstance(visual_tokens, (tuple, list)):
+            visual_tokens = visual_tokens[0]
+
+        # Regroup flat (total_patches, D) into (B, patches_per_sample, D).
+        # Qwen3-VL's ViT returns all patches flattened across the batch.
+        # Use image_grid_thw to compute patches per image and sum per batch element.
+        if visual_tokens.dim() == 2 and image_grid_thw is not None:
+            patches_per_img = (
+                image_grid_thw[:, 0] * image_grid_thw[:, 1] * image_grid_thw[:, 2]
+            )
+            # Sum patches belonging to each batch element
+            patches_per_sample = []
+            for b in range(batch_size):
+                start = b * imgs_per_sample
+                end = start + imgs_per_sample
+                patches_per_sample.append(int(patches_per_img[start:end].sum().item()))
+
+            # Pad to equal length per sample so we can stack into (B, max_patches, D)
+            max_patches = max(patches_per_sample)
+            chunks = torch.split(visual_tokens, patches_per_sample, dim=0)
+            padded = []
+            for chunk in chunks:
+                if chunk.shape[0] < max_patches:
+                    pad = torch.zeros(
+                        max_patches - chunk.shape[0], chunk.shape[1],
+                        dtype=chunk.dtype, device=chunk.device,
+                    )
+                    padded.append(torch.cat([chunk, pad], dim=0))
+                else:
+                    padded.append(chunk)
+            visual_tokens = torch.stack(padded, dim=0)  # (B, max_patches, D)
+
+        # Project to the same dimension the DiT cross-attention expects
+        projected = self.projector(visual_tokens)
+
+        return projected
+
     def _pool_for_value(
         self,
         qwen_features: torch.Tensor,
@@ -566,6 +659,12 @@ class QwenBackbone(nn.Module):
             "backbone_features": qwen_embeds,
             "backbone_attention_mask": qwen_mask,
         }
+
+        # Include ViT features captured by hook (for joint training of System 1 path)
+        if self._cached_vit_output is not None:
+            output["visual_features"] = self.projector(self._cached_vit_output)
+            self._cached_vit_output = None  # Clear to avoid stale references
+
         if self.value_head_enable and self.value_head is not None:
             value_logits, value_scalar = self._compute_value_outputs(qwen_embeds, qwen_mask)
             output["value_logits"] = value_logits
@@ -1208,17 +1307,65 @@ class GR00TN15(PreTrainedModel):
         # Because the behavior of backbones remains the same for training and inference, we can use `forward`.
         return self.backbone(backbone_inputs)
 
+    def run_visual_only(self, inputs: dict | BatchFeature) -> BatchFeature:
+        """Fast visual-only forward for System 1. Bypasses LLM layers.
+
+        Returns BatchFeature with 'visual_features' key containing
+        projected ViT tokens [B, num_visual_tokens, backbone_embedding_dim].
+        Falls back to full run_backbone for legacy EagleBackbone.
+        """
+        if isinstance(self.backbone, QwenBackbone):
+            if isinstance(inputs, BatchFeature):
+                backbone_inputs = inputs
+            else:
+                backbone_inputs = self.prepare_backbone_input(inputs)
+            visual_features = self.backbone.forward_visual_only(backbone_inputs)
+            return BatchFeature(data={"visual_features": visual_features})
+        else:
+            # EagleBackbone doesn't support visual-only extraction
+            # Fall back to full backbone (visual features are embedded in backbone_features)
+            return self.run_backbone(inputs)
+
     def run_action_head(
         self,
         *,
         inputs: dict | BatchFeature,
         backbone_outputs: BatchFeature,
         is_training: bool,
+        fresh_visual_features: torch.Tensor | None = None,
     ) -> BatchFeature:
         if isinstance(inputs, BatchFeature):
             action_inputs = inputs
         else:
             action_inputs = self.prepare_action_input(inputs)
+
+        # Fuse cached System 2 features with fresh System 1 visual features
+        if fresh_visual_features is not None:
+            cached_features = backbone_outputs["backbone_features"]
+            cached_mask = backbone_outputs.get("backbone_attention_mask")
+
+            # fresh_visual_features: [B, S_vit, D]
+            # cached_features: [B, S_s2, D]
+            combined_features = torch.cat([cached_features, fresh_visual_features], dim=1)
+
+            # Build mask for fresh tokens (all valid)
+            fresh_mask = torch.ones(
+                fresh_visual_features.shape[0],
+                fresh_visual_features.shape[1],
+                dtype=cached_mask.dtype if cached_mask is not None else torch.long,
+                device=fresh_visual_features.device,
+            )
+
+            if cached_mask is not None:
+                combined_mask = torch.cat([cached_mask, fresh_mask], dim=1)
+            else:
+                combined_mask = None
+
+            backbone_outputs = BatchFeature(data={
+                "backbone_features": combined_features,
+                "backbone_attention_mask": combined_mask,
+            })
+
         if is_training:
             return self.action_head(backbone_outputs, action_inputs)
         return self.action_head.get_action(backbone_outputs, action_inputs)

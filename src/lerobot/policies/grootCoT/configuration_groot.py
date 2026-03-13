@@ -263,6 +263,20 @@ class GrootCoTConfig(PreTrainedConfig):
     # Explicitly mark async scheduling policy (currently wall-clock only).
     system2_async_wall_clock: bool = True
 
+    # Visual feature dropout probability during training.
+    # When > 0, randomly zeroes fresh visual features to teach the DiT
+    # to function with cached System 2 features alone.
+    visual_dropout_p: float = 0.2
+
+    # Whether to render and inject a grounded reference frame
+    # (with bounding box) as an additional camera view.
+    use_grounded_reference_frame: bool = False
+
+    # Which layer to extract System 1 visual features from.
+    # "vit" = pure ViT output (fastest, most spatial).
+    # An integer = specific LLM layer index (more semantic, slower).
+    system1_visual_source: str = "vit"
+
     # RECAP-style improvement conditioning.
     recap_enable: bool = False
     recap_adv_indicator_key: str = "observation.extra.adv_indicator"
@@ -318,6 +332,16 @@ class GrootCoTConfig(PreTrainedConfig):
             raise ValueError("system2_async_max_observation_age_s must be > 0.")
         if self.system2_async_log_every_n_steps < 1:
             raise ValueError("system2_async_log_every_n_steps must be >= 1.")
+        if not (0.0 <= self.visual_dropout_p <= 1.0):
+            raise ValueError("visual_dropout_p must be in [0, 1].")
+        if self.system1_visual_source != "vit":
+            try:
+                int(self.system1_visual_source)
+            except ValueError:
+                raise ValueError(
+                    f"system1_visual_source must be 'vit' or an integer layer index, "
+                    f"got '{self.system1_visual_source}'"
+                )
         if not (0.0 <= self.recap_adv_indicator_dropout_p <= 1.0):
             raise ValueError("recap_adv_indicator_dropout_p must be in [0, 1].")
         if self.recap_value_head_bins < 2:

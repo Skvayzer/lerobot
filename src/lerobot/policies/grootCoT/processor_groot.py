@@ -175,6 +175,7 @@ def make_groot_pre_post_processors(
                 getattr(config, "dex3_canonical_camera_order", DEFAULT_DEX3_CANONICAL_CAMERA_ORDER)
             ),
             dex3_missing_camera_policy=getattr(config, "dex3_missing_camera_policy", "zero_fill"),
+            use_grounded_reference_frame=getattr(config, "use_grounded_reference_frame", False),
         ),
         # 4. Qwen encode (creates qwen_content)
         GrootQwenEncodeStep(
@@ -338,6 +339,7 @@ class GrootPackInputsStep(ProcessorStep):
         default_factory=lambda: {k: list(v) for k, v in DEFAULT_DEX3_CAMERA_ALIASES.items()}
     )
     dex3_missing_camera_policy: str = "zero_fill"
+    use_grounded_reference_frame: bool = False
 
     def _resolve_dex3_camera_key(self, obs: dict[str, Any], canonical_key: str) -> str | None:
         candidates = [canonical_key, *(self.dex3_camera_aliases.get(canonical_key, []))]
@@ -423,6 +425,39 @@ class GrootPackInputsStep(ProcessorStep):
             if not fallback_keys and "observation.image" in obs:
                 fallback_keys = ["observation.image"]
             img_tensors = [obs[k] for k in fallback_keys]
+
+        # Optionally inject a grounded reference frame with bounding box overlay.
+        # target_bbox can be a single bbox (applied to all batch elements) or a list
+        # of bboxes (one per batch element) for batch-varying targets during training.
+        if self.use_grounded_reference_frame and img_tensors:
+            bbox_data = comp.get("target_bbox")
+            if bbox_data is not None:
+                from lerobot.policies.grootCoT.grounding_utils import render_grounded_frame
+                ref_base = img_tensors[0]
+                ref_np = ref_base.cpu().numpy() if isinstance(ref_base, torch.Tensor) else ref_base
+                # Ensure BHWC uint8 for rendering
+                if ref_np.ndim == 4 and ref_np.shape[1] <= 4:  # BCHW
+                    ref_np = np.transpose(ref_np, (0, 2, 3, 1))
+                if ref_np.dtype != np.uint8:
+                    ref_np = (ref_np * 255).clip(0, 255).astype(np.uint8)
+                bsz = ref_np.shape[0]
+                # Normalize bbox_data to a list of per-element bboxes
+                if isinstance(bbox_data, (list, tuple)) and len(bbox_data) > 0 and isinstance(bbox_data[0], (list, tuple, np.ndarray)):
+                    # List of bboxes, one per batch element
+                    bboxes = bbox_data
+                else:
+                    # Single bbox applied to all batch elements
+                    bboxes = [bbox_data] * bsz
+                # Render bbox on each batch element with its own bbox
+                grounded_batch = np.stack(
+                    [render_grounded_frame(ref_np[i], bboxes[i]) for i in range(bsz)],
+                    axis=0,
+                )  # (B, H, W, C)
+                # Convert back to BCHW tensor to match img_tensors format
+                grounded_tensor = torch.from_numpy(
+                    np.transpose(grounded_batch, (0, 3, 1, 2))
+                ).to(img_tensors[0].device)
+                img_tensors.append(grounded_tensor)
 
         if img_tensors:
             cams = [_to_uint8_np_bhwc(img) for img in img_tensors]
@@ -551,6 +586,7 @@ class GrootPackInputsStep(ProcessorStep):
             "dex3_canonical_camera_order": self.dex3_canonical_camera_order,
             "dex3_camera_aliases": self.dex3_camera_aliases,
             "dex3_missing_camera_policy": self.dex3_missing_camera_policy,
+            "use_grounded_reference_frame": self.use_grounded_reference_frame,
         }
 
     def state_dict(self) -> dict[str, torch.Tensor]:
