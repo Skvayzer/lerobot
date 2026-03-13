@@ -472,10 +472,20 @@ class QwenBackbone(nn.Module):
         # Original logic tried to stack to (B, T, Tokens, Dim) but Qwen2/3-VL expects (TotalTokens, Dim).
         # We leave pixel_values as is (flattened) if it comes from the processor.
         
-        # Flatten image_grid_thw if it's 3D, as Qwen expects a list of grids (flattened batch)
+        # Flatten image_grid_thw if it's 3D, as Qwen expects a list of grids (flattened batch).
+        # Cache pre-flatten shape for regrouping hook-captured ViT output in forward().
         grid = qwen_input.get("image_grid_thw")
         if grid is not None and grid.dim() == 3:
+            self._last_grid_batch_size = grid.shape[0]
+            self._last_grid_imgs_per_sample = grid.shape[1]
             qwen_input["image_grid_thw"] = grid.flatten(0, 1)
+        elif grid is not None:
+            self._last_grid_batch_size = 1
+            self._last_grid_imgs_per_sample = grid.shape[0]
+        else:
+            self._last_grid_batch_size = None
+            self._last_grid_imgs_per_sample = None
+        self._last_image_grid_thw = qwen_input.get("image_grid_thw")
 
         outputs = self.qwen_model(**qwen_input, output_hidden_states=True, return_dict=True)
         hidden_states = outputs.hidden_states
@@ -524,6 +534,57 @@ class QwenBackbone(nn.Module):
         qwen_features = self.projector(qwen_features)
         return qwen_features, qwen_mask
 
+    @staticmethod
+    def _regroup_visual_tokens(
+        visual_tokens: torch.Tensor,
+        image_grid_thw: torch.Tensor,
+        batch_size: int,
+        imgs_per_sample: int,
+        spatial_merge_size: int = 2,
+    ) -> torch.Tensor:
+        """Regroup flat ViT output (total_patches, D) into (B, patches_per_sample, D).
+
+        Qwen3-VL's ViT returns all visual tokens flattened across the entire batch.
+        The actual token count per image is (t * h * w) // spatial_merge_size^2
+        because the ViT internally merges spatial patches.
+
+        Args:
+            visual_tokens: Flat tensor of shape (total_patches, D).
+            image_grid_thw: (total_imgs, 3) tensor of per-image (t, h, w) grids.
+            batch_size: Number of samples in the batch.
+            imgs_per_sample: Number of images per sample.
+            spatial_merge_size: Qwen3-VL's spatial merge factor (default 2).
+
+        Returns:
+            (B, max_patches_per_sample, D) tensor, zero-padded if samples differ.
+        """
+        merge_sq = spatial_merge_size ** 2
+        tokens_per_img = (
+            image_grid_thw[:, 0] * image_grid_thw[:, 1] * image_grid_thw[:, 2]
+        ) // merge_sq
+
+        # Sum tokens belonging to each batch element
+        patches_per_sample = []
+        for b in range(batch_size):
+            start = b * imgs_per_sample
+            end = start + imgs_per_sample
+            patches_per_sample.append(int(tokens_per_img[start:end].sum().item()))
+
+        # Split and pad to equal length so we can stack into (B, max_patches, D)
+        max_patches = max(patches_per_sample)
+        chunks = torch.split(visual_tokens, patches_per_sample, dim=0)
+        padded = []
+        for chunk in chunks:
+            if chunk.shape[0] < max_patches:
+                pad = torch.zeros(
+                    max_patches - chunk.shape[0], chunk.shape[1],
+                    dtype=chunk.dtype, device=chunk.device,
+                )
+                padded.append(torch.cat([chunk, pad], dim=0))
+            else:
+                padded.append(chunk)
+        return torch.stack(padded, dim=0)  # (B, max_patches, D)
+
     def forward_visual_only(self, vl_input: BatchFeature) -> torch.Tensor:
         """Fast path: extract visual features from ViT only, bypassing all LLM layers.
 
@@ -554,6 +615,11 @@ class QwenBackbone(nn.Module):
         if grid_was_3d:
             image_grid_thw = image_grid_thw.flatten(0, 1)
 
+        # Flatten pixel_values if collated to higher dims.
+        # Collation may produce (B, num_imgs, tokens, dim) but ViT expects (total_tokens, dim).
+        if pixel_values.dim() > 2:
+            pixel_values = pixel_values.flatten(0, pixel_values.dim() - 2)
+
         # Call the ViT directly — Qwen3VL's visual encoder takes
         # (hidden_states, grid_thw) where hidden_states is raw pixel_values
         # (patch_embed is applied internally as the first op in visual.forward).
@@ -566,38 +632,20 @@ class QwenBackbone(nn.Module):
         finally:
             self._in_visual_only_mode = False
 
-        # Unwrap tuple output if needed (some Qwen versions)
+        # Unwrap tuple output if needed (Qwen3-VL returns (hidden_states, deep_features))
         if isinstance(visual_tokens, (tuple, list)):
             visual_tokens = visual_tokens[0]
 
         # Regroup flat (total_patches, D) into (B, patches_per_sample, D).
-        # Qwen3-VL's ViT returns all patches flattened across the batch.
-        # Use image_grid_thw to compute patches per image and sum per batch element.
         if visual_tokens.dim() == 2 and image_grid_thw is not None:
-            patches_per_img = (
-                image_grid_thw[:, 0] * image_grid_thw[:, 1] * image_grid_thw[:, 2]
+            spatial_merge_size = getattr(
+                getattr(self.qwen_config, "vision_config", self.qwen_config),
+                "spatial_merge_size", 2,
             )
-            # Sum patches belonging to each batch element
-            patches_per_sample = []
-            for b in range(batch_size):
-                start = b * imgs_per_sample
-                end = start + imgs_per_sample
-                patches_per_sample.append(int(patches_per_img[start:end].sum().item()))
-
-            # Pad to equal length per sample so we can stack into (B, max_patches, D)
-            max_patches = max(patches_per_sample)
-            chunks = torch.split(visual_tokens, patches_per_sample, dim=0)
-            padded = []
-            for chunk in chunks:
-                if chunk.shape[0] < max_patches:
-                    pad = torch.zeros(
-                        max_patches - chunk.shape[0], chunk.shape[1],
-                        dtype=chunk.dtype, device=chunk.device,
-                    )
-                    padded.append(torch.cat([chunk, pad], dim=0))
-                else:
-                    padded.append(chunk)
-            visual_tokens = torch.stack(padded, dim=0)  # (B, max_patches, D)
+            visual_tokens = self._regroup_visual_tokens(
+                visual_tokens, image_grid_thw,
+                batch_size, imgs_per_sample, spatial_merge_size,
+            )
 
         # Project to the same dimension the DiT cross-attention expects
         projected = self.projector(visual_tokens)
@@ -660,9 +708,20 @@ class QwenBackbone(nn.Module):
             "backbone_attention_mask": qwen_mask,
         }
 
-        # Include ViT features captured by hook (for joint training of System 1 path)
+        # Include ViT features captured by hook (for joint training of System 1 path).
+        # Regroup flat (total_patches, D) to (B, patches_per_sample, D) using cached grid info.
         if self._cached_vit_output is not None:
-            output["visual_features"] = self.projector(self._cached_vit_output)
+            vit_out = self._cached_vit_output
+            grid_thw = getattr(self, "_last_image_grid_thw", None)
+            if vit_out.dim() == 2 and grid_thw is not None:
+                bs = getattr(self, "_last_grid_batch_size", 1) or 1
+                ips = getattr(self, "_last_grid_imgs_per_sample", grid_thw.shape[0]) or grid_thw.shape[0]
+                sms = getattr(
+                    getattr(self.qwen_config, "vision_config", self.qwen_config),
+                    "spatial_merge_size", 2,
+                )
+                vit_out = self._regroup_visual_tokens(vit_out, grid_thw, bs, ips, sms)
+            output["visual_features"] = self.projector(vit_out)
             self._cached_vit_output = None  # Clear to avoid stale references
 
         if self.value_head_enable and self.value_head is not None:
