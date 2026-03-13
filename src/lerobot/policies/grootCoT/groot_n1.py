@@ -134,16 +134,15 @@ class QwenBackbone(nn.Module):
         self._tokenizer = None
 
         _is_rocm_early = getattr(torch.version, "hip", None) is not None
-        dtype = torch.bfloat16 if load_bf16 else None
         self.qwen_config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
         load_kwargs = {"trust_remote_code": True}
-        if dtype is not None:
-            load_kwargs["torch_dtype"] = dtype
-        elif _is_rocm_early:
-            # On ROCm, force FP32 to override model config "bfloat16" default.
-            # BF16 ViT on AMD MI210 (gfx90a) produces NaN even with eager attention.
-            load_kwargs["dtype"] = torch.float32
-            print(f"[GROOT] ROCm: forcing dtype=float32 (hip={torch.version.hip}) to prevent ViT NaN.", flush=True)
+        if _is_rocm_early:
+            # On ROCm (AMD MI210 gfx90a), BF16 produces NaN in both ViT and LLM layers.
+            # Force FP32 for the entire model regardless of load_bf16 setting.
+            load_kwargs["torch_dtype"] = torch.float32
+            print(f"[GROOT] ROCm: forcing torch_dtype=float32 (hip={torch.version.hip}, load_bf16={load_bf16}) to prevent NaN.", flush=True)
+        elif load_bf16:
+            load_kwargs["torch_dtype"] = torch.bfloat16
         if attn_implementation is not None:
             load_kwargs["attn_implementation"] = attn_implementation
 
