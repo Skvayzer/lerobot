@@ -188,7 +188,7 @@ export MASTER_PORT=29500
 # Batch size per GPU: start with 4 (conservative for Qwen3-VL-8B + DiT)
 # Total effective batch = 4 * 8 = 32
 # If this OOMs, reduce to 2; if it fits easily, try 8
-BATCH_SIZE_PER_GPU=4
+BATCH_SIZE_PER_GPU=10
 
 echo "Master: ${MASTER_ADDR}:${MASTER_PORT} | Nodes: $NUM_NODES | GPUs: $TOTAL_GPUS | batch: ${BATCH_SIZE_PER_GPU}x${TOTAL_GPUS}=$((BATCH_SIZE_PER_GPU * TOTAL_GPUS))"
 echo "Output dir: $OUTPUT_DIR"
