@@ -216,6 +216,11 @@ class GrootCoTPolicy(PreTrainedPolicy):
         self._async_refresh_count: int = 0
         self._async_exception: str | None = None
 
+        # CraftNet System 2 → System 1 semantic intent state
+        self._current_subtask_text: str | None = None
+        self._current_target_bbox: list[float] | None = None
+        self._subtask_index: int = 0
+
     def get_optim_params(self) -> dict:
         return self.parameters()
 
@@ -870,6 +875,20 @@ class GrootCoTPolicy(PreTrainedPolicy):
         self._inference_step += 1
         return actions
 
+    def get_subtask_overrides(self) -> dict[str, Any]:
+        """Return current sub-task state for injection into the processor pipeline.
+
+        The inference loop should merge these into the transition's complementary
+        data **before** the processor runs, so the language and bbox reach
+        tokenization and grounded reference frame rendering.
+        """
+        overrides: dict[str, Any] = {}
+        if self._current_subtask_text is not None:
+            overrides["current_subtask_text"] = self._current_subtask_text
+        if self._current_target_bbox is not None:
+            overrides["target_bbox"] = self._current_target_bbox
+        return overrides
+
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
         """Select single action from action queue."""
@@ -984,10 +1003,10 @@ class GrootCoTPolicy(PreTrainedPolicy):
         temperature: float = 0.7,
         top_p: float = 0.9,
     ) -> list[dict[str, str | int]]:
-        """Generate and return Qwen reasoning traces for the current batch."""
+        """Generate reasoning traces and update System 1 sub-task state."""
         self.eval()
         groot_inputs = self._build_groot_inputs(batch, include_action=False)
-        return self._groot_model.extract_cot_trace(
+        traces = self._groot_model.extract_cot_trace(
             groot_inputs,
             cot_session=cot_session,
             dataset_meta=dataset_meta,
@@ -996,6 +1015,22 @@ class GrootCoTPolicy(PreTrainedPolicy):
             temperature=temperature,
             top_p=top_p,
         )
+        self._update_subtask_from_traces(traces)
+        return traces
+
+    def _update_subtask_from_traces(self, traces: list[dict]) -> None:
+        """Extract sub-task text and bbox from CoT traces into persistent state."""
+        if not traces or not traces[0].get("parse_ok"):
+            return
+        from lerobot.policies.grootCoT.cot_schema import extract_subtask_fields
+        parsed = traces[0].get("parsed_json")
+        if not isinstance(parsed, dict):
+            return
+        subtask_text, target_bbox = extract_subtask_fields(parsed)
+        if subtask_text:
+            self._current_subtask_text = subtask_text
+        if target_bbox is not None:
+            self._current_target_bbox = target_bbox
 
     # -------------------------
     # Internal helpers

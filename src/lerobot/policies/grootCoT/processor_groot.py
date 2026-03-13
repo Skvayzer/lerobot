@@ -477,6 +477,15 @@ class GrootPackInputsStep(ProcessorStep):
             lang = lang[0] if len(lang) > 0 else None
         if not lang:
             lang = "Perform the task."
+
+        # System 2 sub-task override: use decomposed sub-task instruction if available.
+        # When System 2 has decomposed the task into sub-tasks, System 1 receives the
+        # specific current sub-task (e.g. "grasp the red block with right hand")
+        # instead of the full task description.
+        subtask_text = comp.get("current_subtask_text")
+        if subtask_text:
+            lang = subtask_text
+
         # Append summary prompt/sentinel for downstream summary-state pooling
         lang = f"{lang}\n{SUMMARY_PROMPT}"
         if self.formalize_language:

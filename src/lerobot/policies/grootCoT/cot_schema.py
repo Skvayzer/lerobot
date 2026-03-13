@@ -58,7 +58,8 @@ Rules:
 3. RECAP labels are mandatory every call: recap.reward_label.r_t, recap.value_target.v_hat, recap.advantage.indicator_I.
 4. indicator_I must be exactly "POS", "NEG", or "DROPPED". Set "DROPPED" with ~30% probability to simulate dropout.
 5. Estimate v_hat as -(remaining_steps_estimate) / max_episode_steps, clipped to [-1, 0].
-6. next.system1_subtask_text must be a short imperative instruction (≤15 words) for the low-level action policy."""
+6. next.system1_subtask_text must be a short imperative instruction (≤15 words) for the low-level action policy.
+7. next.target_bbox is optional: [x1, y1, x2, y2] in normalised 0-1 image coordinates for the target object. Include it when a specific object should be grounded visually."""
 
 # ---------------------------------------------------------------------------
 # Prompt builders
@@ -121,6 +122,7 @@ Output ONE JSON object with these fields filled:
   execution_state: active_step_id = plan.steps[0].step_id, active_step_status = "ongoing", retries_used = 0
   next.decision = "continue"
   next.system1_subtask_text: short first instruction for System-1
+  next.target_bbox: [x1, y1, x2, y2] normalised 0-1 coords of target object (optional, include if a specific object should be highlighted)
   next.expected_horizon_steps: integer estimate
   events: all false initially
   progress.phi_total: 0.0
@@ -171,6 +173,7 @@ Output ONE JSON object:
   execution_state: update active_step_id, active_step_status, retries_used, stall_counter
   next.decision: "continue"|"advance"|"recover"|"replan"|"abort"
   next.system1_subtask_text: current short instruction for System-1 (≤15 words)
+  next.target_bbox: [x1, y1, x2, y2] normalised 0-1 coords of target object (optional)
   next.expected_horizon_steps: remaining steps estimate
   events: detect dropped_object, wrong_object, spill, tower_unstable (true/false + conf)
   progress.phi_total: fraction of plan completed [0,1]
@@ -246,6 +249,31 @@ def parse_cot_json(raw_text: str) -> tuple[dict | None, str | None]:
             return None, f"parse_failed_after_repair: {e}"
 
     return None, f"no_json_found (len={len(text)})"
+
+
+def extract_subtask_fields(parsed_json: dict) -> tuple[str | None, list[float] | None]:
+    """Extract System-1 conditioning fields from a parsed CoT JSON.
+
+    Returns (subtask_text, target_bbox).  Both may be None if absent.
+    """
+    next_block = parsed_json.get("next")
+    if not isinstance(next_block, dict):
+        return None, None
+
+    subtask_text = next_block.get("system1_subtask_text")
+    if subtask_text is not None:
+        subtask_text = str(subtask_text).strip() or None
+
+    bbox = next_block.get("target_bbox")
+    if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+        try:
+            bbox = [float(v) for v in bbox]
+        except (TypeError, ValueError):
+            bbox = None
+    else:
+        bbox = None
+
+    return subtask_text, bbox
 
 
 # ---------------------------------------------------------------------------
