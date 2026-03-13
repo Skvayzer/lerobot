@@ -103,8 +103,8 @@ def make_synthetic_batch(
     state_mask = torch.zeros(batch_size, max_state, dtype=torch.bool, device=device)
     state_mask[:, :state_dim] = True
     action = torch.randn(batch_size, groot_action_horizon, groot_action_dim, device=device)
-    action_mask = torch.zeros(batch_size, groot_action_dim, dtype=torch.bool, device=device)
-    action_mask[:, :action_dim] = True
+    action_mask = torch.zeros(batch_size, 1, groot_action_dim, dtype=torch.bool, device=device)
+    action_mask[:, :, :action_dim] = True
     print(f"[TEST] Using groot action_dim={groot_action_dim}, horizon={groot_action_horizon}")
     embodiment_id = torch.zeros(batch_size, dtype=torch.long, device=device)
 
