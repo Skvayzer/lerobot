@@ -111,7 +111,7 @@ def test_scenario_a(device):
     assert not model._dual_rate_train_enabled(), "dual_rate_train should be disabled"
     print("  [OK] dual_rate_enabled=False, dual_rate_train_enabled=False")
 
-    # Patch _groot_model.forward to trace the call
+    # Patch _groot_model.forward to trace the legacy call
     original_forward = model._groot_model.forward
     forward_called = [False]
 
@@ -119,16 +119,16 @@ def test_scenario_a(device):
         forward_called[0] = True
         return original_forward(*args, **kwargs)
 
-    # Patch run_action_head to detect if CraftNet path is taken
-    original_rah = model._groot_model.run_action_head
-    rah_called = [False]
+    # Patch _get_backbone_outputs_for_training to detect CraftNet path
+    original_gboft = model._get_backbone_outputs_for_training
+    gboft_called = [False]
 
-    def traced_rah(*args, **kwargs):
-        rah_called[0] = True
-        return original_rah(*args, **kwargs)
+    def traced_gboft(*args, **kwargs):
+        gboft_called[0] = True
+        return original_gboft(*args, **kwargs)
 
     model._groot_model.forward = traced_forward
-    model._groot_model.run_action_head = traced_rah
+    model._get_backbone_outputs_for_training = traced_gboft
 
     try:
         loss_tensor, loss_dict = model.forward(batch)
@@ -139,17 +139,17 @@ def test_scenario_a(device):
         return False
 
     model._groot_model.forward = original_forward
-    model._groot_model.run_action_head = original_rah
+    model._get_backbone_outputs_for_training = original_gboft
 
     if not forward_called[0]:
         print("  [FAIL] _groot_model.forward was NOT called (expected legacy path)")
         return False
     print("  [OK] Legacy _groot_model.forward() was called")
 
-    if rah_called[0]:
-        print("  [FAIL] run_action_head was called (CraftNet path should NOT be taken)")
+    if gboft_called[0]:
+        print("  [FAIL] _get_backbone_outputs_for_training was called (CraftNet dual-rate path taken)")
         return False
-    print("  [OK] run_action_head was NOT called (no CraftNet intervention)")
+    print("  [OK] CraftNet dual-rate training path NOT taken")
 
     loss = loss_tensor if isinstance(loss_tensor, torch.Tensor) else loss_dict.get("loss")
     if loss is None or torch.isnan(loss):
