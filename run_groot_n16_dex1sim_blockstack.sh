@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
+#SBATCH --nodes=2
+#SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=32
 #SBATCH --time=3-00:00:00
@@ -305,40 +305,79 @@ print('GR00T N1.6 download complete')
 
 OUTPUT_DIR=outputs/train/$(date +%Y%m%d_%H%M%S)_groot_n16_dex1sim_blockstack
 
-accelerate launch \
-  --multi_gpu --num_processes=4 --num_machines=1 --mixed_precision=no \
-  src/lerobot/scripts/lerobot_train.py \
-  --output_dir="$OUTPUT_DIR" \
-  --policy.type=groot_n16 \
-  --policy.base_model_path=nvidia/GR00T-N1.6-3B \
-  --policy.embodiment_tag=unitree_g1 \
-  --policy.chunk_size=50 \
-  --policy.n_action_steps=50 \
-  --policy.max_state_dim=128 \
-  --policy.max_action_dim=128 \
-  --policy.tune_llm=false \
-  --policy.tune_visual=false \
-  --policy.tune_projector=true \
-  --policy.tune_diffusion_model=true \
-  --policy.use_bf16=true \
-  --policy.use_flash_attention=false \
-  --policy.push_to_hub=false \
-  --dataset.repo_id=unitreerobotics/G1_Dex1_StackRygBlock_Dataset_Sim \
-  --dataset.root="$HF_LEROBOT_HOME" \
-  --dataset.robot_types='["g1"]' \
-  --dataset.video_backend=pyav \
-  --tolerance_s=5e-4 \
-  --dataset.tolerance_s=5e-4 \
-  --batch_size=32 \
-  --num_workers=4 \
-  --epochs=5 \
-  --save_freq=2000 \
-  --keep_last_n_checkpoints=2 \
-  --wandb.enable=true \
-  --wandb.project=G1_Groot_Baselines \
-  --wandb.entity=skvayzer \
-  --wandb.disable_artifact=true \
-  --wandb.notes="GR00T N1.6 Dex1 Sim: 32-layer AlternateVLDiT, max_state/action_dim=29"
+# Multi-node distributed setup
+export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
+export MASTER_PORT=29500
+echo "Master: ${MASTER_ADDR}:${MASTER_PORT} | Nodes: 2 | GPUs: 8 | batch_size: 32"
 
+# Write a per-rank launcher to the shared filesystem so srun tasks on both nodes
+# can source conda and receive correctly-expanded variables.
+LAUNCHER="${LEROBOT_DIR}/tmp_launch_${SLURM_JOB_ID}.sh"
+cat > "$LAUNCHER" <<LAUNCH_SCRIPT
+#!/bin/bash
+source /vast/users/chenyuan.chen/miniconda3/bin/activate unitree_lerobot_amd
+cd ${LEROBOT_DIR}
+export HF_HOME=${HF_HOME}
+export HF_LEROBOT_HOME=${HF_LEROBOT_HOME}
+export TOKENIZERS_PARALLELISM=false
+export HF_HUB_DISABLE_XET=1
+export HF_HUB_ENABLE_HF_TRANSFER=0
+# Per-rank local /tmp caches to avoid cross-node VAST flock (ENOLCK) issues
+RANK_CACHE=/tmp/${USER}/rocm_cache_${SLURM_JOB_ID}_\${SLURM_PROCID}
+mkdir -p "\${RANK_CACHE}"/{miopen_db,miopen_cache,torch_kernels,xdg_cache,hf_datasets}
+export MIOPEN_USER_DB_PATH="\${RANK_CACHE}/miopen_db"
+export MIOPEN_CUSTOM_CACHE_DIR="\${RANK_CACHE}/miopen_cache"
+export XDG_CACHE_HOME="\${RANK_CACHE}/xdg_cache"
+export PYTORCH_KERNEL_CACHE_PATH="\${RANK_CACHE}/torch_kernels"
+export USE_PYTORCH_KERNEL_CACHE=1
+# Redirect HF datasets builder cache to local /tmp so FileLock uses local fs
+# (VAST does not support fcntl.flock across nodes → ENOLCK errno 37)
+export HF_DATASETS_CACHE="\${RANK_CACHE}/hf_datasets"
+export ROCR_VISIBLE_DEVICES=0,1,2,3
+accelerate launch \\
+  --multi_gpu --num_processes=8 --num_machines=2 \\
+  --machine_rank=\${SLURM_PROCID} \\
+  --main_process_ip=${MASTER_ADDR} \\
+  --main_process_port=${MASTER_PORT} \\
+  --mixed_precision=no \\
+  src/lerobot/scripts/lerobot_train.py \\
+  --output_dir=${OUTPUT_DIR} \\
+  --policy.type=groot_n16 \\
+  --policy.base_model_path=nvidia/GR00T-N1.6-3B \\
+  --policy.embodiment_tag=unitree_g1 \\
+  --policy.chunk_size=50 \\
+  --policy.n_action_steps=50 \\
+  --policy.max_state_dim=128 \\
+  --policy.max_action_dim=128 \\
+  --policy.tune_llm=false \\
+  --policy.tune_visual=false \\
+  --policy.tune_projector=true \\
+  --policy.tune_diffusion_model=true \\
+  --policy.use_bf16=true \\
+  --policy.use_flash_attention=false \\
+  --policy.push_to_hub=false \\
+  --dataset.repo_id=unitreerobotics/G1_Dex1_StackRygBlock_Dataset_Sim \\
+  --dataset.root=${HF_LEROBOT_HOME} \\
+  '--dataset.robot_types=["g1"]' \\
+  --dataset.video_backend=pyav \\
+  --tolerance_s=5e-4 \\
+  --dataset.tolerance_s=5e-4 \\
+  --batch_size=16 \\
+  --num_workers=4 \\
+  --epochs=5 \\
+  --save_freq=2000 \\
+  --keep_last_n_checkpoints=2 \\
+  --wandb.enable=true \\
+  --wandb.project=G1_Groot_Baselines \\
+  --wandb.entity=skvayzer \\
+  --wandb.disable_artifact=true \\
+  '--wandb.notes=GR00T N1.6 Dex1 Sim: 32-layer AlternateVLDiT, max_state/action_dim=29'
+LAUNCH_SCRIPT
+chmod +x "$LAUNCHER"
+
+srun --export=ALL bash "$LAUNCHER"
+TRAIN_RC=$?
+rm -f "$LAUNCHER"
 echo "Done: $(date)"
 echo "Output: $OUTPUT_DIR"
+exit $TRAIN_RC
