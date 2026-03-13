@@ -151,7 +151,10 @@ def test_dual_path_gradients():
     backbone = model._groot_model.backbone
     projector = backbone.projector
     print(f"[INFO] Projector: {projector}")
-    print(f"[INFO] Qwen config hidden_size: {backbone.qwen_config.hidden_size}")
+    hs = getattr(backbone.qwen_config, "hidden_size", None)
+    if hs is None:
+        hs = getattr(getattr(backbone.qwen_config, "text_config", None), "hidden_size", "N/A")
+    print(f"[INFO] Qwen config hidden_size: {hs}")
     vision_cfg = getattr(backbone.qwen_config, "vision_config", None)
     if vision_cfg:
         print(f"[INFO] Vision config hidden_size: {getattr(vision_cfg, 'hidden_size', 'N/A')}")
