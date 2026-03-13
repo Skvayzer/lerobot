@@ -36,11 +36,16 @@ if TYPE_CHECKING or _transformers_available:
         AutoModelForCausalLM,
         AutoModelForVision2Seq,
         AutoTokenizer,
-        Qwen3VLForConditionalGeneration,
         PretrainedConfig,
         PreTrainedModel,
     )
     from transformers.feature_extraction_utils import BatchFeature
+    # Qwen3VLForConditionalGeneration requires transformers >= 4.53 with Qwen3-VL support.
+    # Gracefully degrade to None if not available (will fall back to AutoModel).
+    try:
+        from transformers import Qwen3VLForConditionalGeneration
+    except ImportError:
+        Qwen3VLForConditionalGeneration = None
 else:
     AutoConfig = None
     AutoModel = None
@@ -1763,7 +1768,8 @@ class GR00TN15(PreTrainedModel):
                         "device_map": "cpu",
                         "dtype": torch.float32,
                     }
-                    _qwen_cpu = Qwen3VLForConditionalGeneration.from_pretrained(_model_id, **_fix_load_kw)
+                    _reload_cls = Qwen3VLForConditionalGeneration if Qwen3VLForConditionalGeneration is not None else AutoModel
+                    _qwen_cpu = _reload_cls.from_pretrained(_model_id, **_fix_load_kw)
                     _cpu_sd = _qwen_cpu.state_dict()
                     _reloaded, _skipped = 0, 0
                     with torch.no_grad():
