@@ -138,7 +138,7 @@ def test_processor_language_override():
     )
 
     # Build a minimal transition dict
-    from lerobot.processors.preprocessor import TransitionKey
+    from lerobot.processor.core import TransitionKey
     transition = {
         TransitionKey.OBSERVATION: {
             "observation.images.front": torch.rand(1, 3, 480, 640),
