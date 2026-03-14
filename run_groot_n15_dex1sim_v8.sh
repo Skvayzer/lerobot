@@ -8,6 +8,7 @@
 #SBATCH --qos=gtqos
 #SBATCH --mem=256G
 #SBATCH --job-name=groot_n15_dex1sim_v8
+#SBATCH --exclude=auh7-1b-gpu-215
 #SBATCH --output=/vast/users/chenyuan.chen/constantine/unitree_IL_lerobot/unitree_lerobot/lerobot/slurm_groot_n15_dex1sim_v8_%j.log
 #SBATCH --error=/vast/users/chenyuan.chen/constantine/unitree_IL_lerobot/unitree_lerobot/lerobot/slurm_groot_n15_dex1sim_v8_%j.log
 
@@ -58,7 +59,7 @@ export PYTORCH_KERNEL_CACHE_PATH="$CACHE_ROOT/torch_kernels"
 export USE_PYTORCH_KERNEL_CACHE=1
 
 # Note: BF16 kept to avoid OOM. Primary v7 issue was LR schedule, not BF16.
-# export HIPBLAS_OP_DTYPE_FP32=1
+export PYTORCH_HIP_ALLOC_CONF=expandable_segments:True
 
 NUM_GPUS=4
 echo "GPUs: $NUM_GPUS | Conda: $CONDA_DEFAULT_ENV"
