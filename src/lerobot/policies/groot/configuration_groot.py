@@ -105,7 +105,13 @@ class GrootConfig(PreTrainedConfig):
     optimizer_betas: tuple[float, float] = (0.95, 0.999)
     optimizer_eps: float = 1e-8
     optimizer_weight_decay: float = 1e-5
+    optimizer_grad_clip_norm: float = 1.0
     warmup_ratio: float = 0.05
+    # Number of steps over which the cosine LR decay runs.
+    # 0 means "use total training steps" (recommended).
+    scheduler_num_decay_steps: int = 0
+    # Minimum LR as a fraction of peak LR (e.g. 0.1 → decay to peak_lr * 0.1).
+    scheduler_decay_lr_ratio: float = 0.1
     use_bf16: bool = True
 
     # Dataset parameters
@@ -185,15 +191,24 @@ class GrootConfig(PreTrainedConfig):
             betas=self.optimizer_betas,
             eps=self.optimizer_eps,
             weight_decay=self.optimizer_weight_decay,
+            grad_clip_norm=self.optimizer_grad_clip_norm,
         )
 
     def get_scheduler_preset(self) -> CosineDecayWithWarmupSchedulerConfig:
-        """Return scheduler configuration."""
+        """Return scheduler configuration.
+
+        When scheduler_num_decay_steps == 0 (default), we set num_decay_steps
+        to a very large sentinel value so that the scheduler's auto-scaling
+        logic (triggered when num_training_steps < num_decay_steps) will
+        shrink it to exactly match the actual training length.
+        """
+        num_decay = self.scheduler_num_decay_steps if self.scheduler_num_decay_steps > 0 else 10_000_000
+        num_warmup = int(num_decay * self.warmup_ratio)
         return CosineDecayWithWarmupSchedulerConfig(
-            num_warmup_steps=int(10000 * self.warmup_ratio),  # 5% warmup by default
-            num_decay_steps=10000,  # Adjust based on training steps
+            num_warmup_steps=num_warmup,
+            num_decay_steps=num_decay,
             peak_lr=self.optimizer_lr,
-            decay_lr=self.optimizer_lr * 0.1,
+            decay_lr=self.optimizer_lr * self.scheduler_decay_lr_ratio,
         )
 
     @property
