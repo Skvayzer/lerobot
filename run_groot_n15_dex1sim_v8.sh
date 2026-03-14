@@ -19,7 +19,7 @@ cd "$LEROBOT_DIR"
 echo "=========================================="
 echo "GR00T N1.5 Dex1 Sim BlockStacking v8 (4 GPU, no LoRA)"
 echo "Fixes vs v7:"
-echo "  1. FP32 instead of BF16 (MI210 BF16 matmul precision issues)"
+echo "  1. BF16 kept (FP32 OOMs on MI210); primary fix is LR schedule"
 echo "  2. LR schedule spans full training (was exhausted at step 10K/77K)"
 echo "  3. 20K steps (NVIDIA recommended) instead of 77K overfitting"
 echo "  4. Grad clip 1.0 (HF Trainer default) instead of 10.0"
@@ -57,8 +57,8 @@ export XDG_CACHE_HOME="$CACHE_ROOT/xdg_cache"
 export PYTORCH_KERNEL_CACHE_PATH="$CACHE_ROOT/torch_kernels"
 export USE_PYTORCH_KERNEL_CACHE=1
 
-# Force FP32 on MI210 — BF16 matmuls produce incorrect gradients on gfx90a/ROCm 7.0
-export HIPBLAS_OP_DTYPE_FP32=1
+# Note: BF16 kept to avoid OOM. Primary v7 issue was LR schedule, not BF16.
+# export HIPBLAS_OP_DTYPE_FP32=1
 
 NUM_GPUS=4
 echo "GPUs: $NUM_GPUS | Conda: $CONDA_DEFAULT_ENV"
@@ -95,7 +95,7 @@ accelerate launch \
   --policy.tune_visual=false \
   --policy.tune_projector=true \
   --policy.tune_diffusion_model=true \
-  --policy.use_bf16=false \
+  --policy.use_bf16=true \
   --policy.scheduler_num_decay_steps=0 \
   --policy.scheduler_decay_lr_ratio=0.01 \
   --policy.push_to_hub=false \
@@ -116,7 +116,7 @@ accelerate launch \
   --wandb.project=G1_Groot_Baselines \
   --wandb.entity=skvayzer \
   --wandb.disable_artifact=true \
-  --wandb.notes="GR00T-N1.5 Dex1 Sim v8: FP32, LR spans full 20K, grad_clip=1.0, img aug ON"
+  --wandb.notes="GR00T-N1.5 Dex1 Sim v8: BF16, LR spans full 20K, grad_clip=1.0, img aug ON"
 
 echo "Done: $(date)"
 echo "Output: $OUTPUT_DIR"
