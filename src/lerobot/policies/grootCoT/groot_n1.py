@@ -481,6 +481,9 @@ class QwenBackbone(nn.Module):
             self._last_grid_imgs_per_sample = None
         self._last_image_grid_thw = qwen_input.get("image_grid_thw")
 
+        # Cache input_ids for image_mask computation in forward()
+        self._last_input_ids = qwen_input.get("input_ids")
+
         outputs = self.qwen_model(**qwen_input, output_hidden_states=True, return_dict=True)
         hidden_states = outputs.hidden_states
         if hidden_states is None:
@@ -701,6 +704,24 @@ class QwenBackbone(nn.Module):
             "backbone_features": qwen_embeds,
             "backbone_attention_mask": qwen_mask,
         }
+
+        # Compute image_mask for N1.6 AlternateVLDiT.
+        # When summary_pos is used (single summary token), there are no image tokens
+        # in the output — create an all-False mask. When full sequence is returned,
+        # identify image tokens via the <|image_pad|> token ID in input_ids.
+        if qwen_mask is not None:
+            _input_ids = getattr(self, "_last_input_ids", None)
+            if _input_ids is not None and _input_ids.shape[1] == qwen_mask.shape[1]:
+                _img_token_id = getattr(self.qwen_config, "image_token_id", None)
+                if _img_token_id is not None:
+                    output["image_mask"] = (_input_ids == _img_token_id)
+                else:
+                    output["image_mask"] = torch.zeros_like(qwen_mask, dtype=torch.bool)
+            else:
+                # Summary mode or shape mismatch — no image tokens in output
+                output["image_mask"] = torch.zeros_like(qwen_mask, dtype=torch.bool)
+        else:
+            output["image_mask"] = None
 
         # Include ViT features captured by hook (for joint training of System 1 path).
         # Regroup flat (total_patches, D) to (B, patches_per_sample, D) using cached grid info.
@@ -1114,7 +1135,20 @@ class GR00TN15(PreTrainedModel):
         self.local_model_path = local_model_path
 
         backbone_cfg = dict(config.backbone_cfg)
-        
+
+        # Auto-configure dimensions for N1.6 action head
+        _ah_version = getattr(config, "action_head_version", "n15")
+        if _ah_version == "n16":
+            _ah_cfg = dict(config.action_head_cfg)
+            _ah_cfg.setdefault("backbone_embedding_dim", 2048)
+            _ah_cfg.setdefault("max_state_dim", 128)
+            _ah_cfg.setdefault("max_action_dim", 128)
+            _ah_cfg.setdefault("action_horizon", config.chunk_size)
+            config.action_head_cfg = _ah_cfg
+            print(f"[GROOT] N1.6 action head: backbone_dim={_ah_cfg['backbone_embedding_dim']}, "
+                  f"state_dim={_ah_cfg['max_state_dim']}, action_dim={_ah_cfg['max_action_dim']}, "
+                  f"horizon={_ah_cfg['action_horizon']}")
+
         # Determine expected dimension from Action Head
         expected_dim = config.action_head_cfg.get("backbone_embedding_dim")
         
@@ -1167,19 +1201,45 @@ class GR00TN15(PreTrainedModel):
             print(f"[GROOT] Initializing QwenBackbone with LoRA config: {lora_cfg}")
             self.backbone = QwenBackbone(**backbone_cfg, lora_config=lora_cfg)
 
-        action_head_cfg = FlowmatchingActionHeadConfig(**config.action_head_cfg)
-        
-        # Propagate Action Head LoRA config
-        ah_lora_cfg = getattr(config, "action_head_lora_config", {})
-        if not ah_lora_cfg:
-             ah_lora_cfg = {
-                "r": getattr(config, "action_head_lora_rank", 0),
-                "lora_alpha": getattr(config, "action_head_lora_alpha", 16),
-                "lora_dropout": getattr(config, "action_head_lora_dropout", 0.1),
-                "target_modules": getattr(config, "action_head_lora_target_modules", None),
-             }
-        
-        self.action_head = FlowmatchingActionHead(action_head_cfg, lora_config=ah_lora_cfg)
+        # Select action head version: N1.5 (default) or N1.6
+        _ah_version = getattr(config, "action_head_version", "n15")
+        if _ah_version == "n16":
+            from lerobot.policies.grootCoT.action_head_n16.gr00t_n1d6_action_head import (
+                Gr00tN1d6ActionHead,
+                N16ActionHeadConfig,
+            )
+            _n16_cfg = N16ActionHeadConfig(
+                backbone_embedding_dim=config.action_head_cfg.get("backbone_embedding_dim", 2048),
+                max_state_dim=config.action_head_cfg.get("max_state_dim", config.max_state_dim),
+                max_action_dim=config.action_head_cfg.get("max_action_dim", config.max_action_dim),
+                action_horizon=config.action_head_cfg.get("action_horizon", config.chunk_size),
+                tune_projector=getattr(config, "tune_projector", True),
+                tune_diffusion_model=getattr(config, "tune_diffusion_model", True),
+                tune_vlln=getattr(config, "tune_vlln", True),
+            )
+            self.action_head = Gr00tN1d6ActionHead(_n16_cfg)
+            _weights_path = getattr(config, "n16_action_head_weights_path", None)
+            if _weights_path:
+                import torch as _torch
+                _weights = _torch.load(_weights_path, map_location="cpu")
+                _missing, _unexpected = self.action_head.load_state_dict(_weights, strict=False)
+                print(f"[GROOT] Loaded N1.6 action head: {len(_weights)} keys, "
+                      f"missing={len(_missing)}, unexpected={len(_unexpected)}")
+                if _missing:
+                    print(f"[GROOT] Missing keys: {_missing[:5]}...")
+            print(f"[GROOT] Using N1.6 action head (Gr00tN1d6ActionHead)")
+        else:
+            action_head_cfg = FlowmatchingActionHeadConfig(**config.action_head_cfg)
+            # Propagate Action Head LoRA config
+            ah_lora_cfg = getattr(config, "action_head_lora_config", {})
+            if not ah_lora_cfg:
+                 ah_lora_cfg = {
+                    "r": getattr(config, "action_head_lora_rank", 0),
+                    "lora_alpha": getattr(config, "action_head_lora_alpha", 16),
+                    "lora_dropout": getattr(config, "action_head_lora_dropout", 0.1),
+                    "target_modules": getattr(config, "action_head_lora_target_modules", None),
+                 }
+            self.action_head = FlowmatchingActionHead(action_head_cfg, lora_config=ah_lora_cfg)
 
         self.action_horizon = config.action_horizon
         self.action_dim = config.action_dim
@@ -1425,9 +1485,23 @@ class GR00TN15(PreTrainedModel):
             else:
                 combined_mask = None
 
+            # Rebuild image_mask: fresh visual tokens ARE image tokens
+            cached_image_mask = backbone_outputs.get("image_mask")
+            if cached_image_mask is not None:
+                fresh_image_mask = torch.ones(
+                    fresh_visual_features.shape[0],
+                    fresh_visual_features.shape[1],
+                    dtype=torch.bool,
+                    device=fresh_visual_features.device,
+                )
+                combined_image_mask = torch.cat([cached_image_mask, fresh_image_mask], dim=1)
+            else:
+                combined_image_mask = None
+
             backbone_outputs = BatchFeature(data={
                 "backbone_features": combined_features,
                 "backbone_attention_mask": combined_mask,
+                "image_mask": combined_image_mask,
             })
 
         if is_training:

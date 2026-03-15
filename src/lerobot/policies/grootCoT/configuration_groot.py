@@ -171,6 +171,22 @@ class GrootCoTConfig(PreTrainedConfig):
     # Freeze backbone and policy; train only the VLM->actor projector
     train_vlm_projector_only: bool = True
 
+    # N1.6 action head: "n15" uses existing FlowmatchingActionHead, "n16" uses Gr00tN1d6ActionHead
+    action_head_version: str = "n15"
+    # Path to extracted N1.6 action head pretrained weights (.pt file)
+    n16_action_head_weights_path: str | None = None
+
+    # Relative actions: subtract current state from target action during training,
+    # add current state back during inference
+    use_relative_actions: bool = False
+
+    # FLARE future prediction
+    flare_enable: bool = False
+    flare_coefficient: float = 0.2
+    flare_target_dim: int = 4096
+    flare_future_offset: int = 30
+    num_future_tokens: int = 32
+
     # LoRA parameters (from groot_finetune_script.py)
     # Rank for the LORA model. If 0, no LORA will be used.
     lora_rank: int = 0
@@ -357,6 +373,13 @@ class GrootCoTConfig(PreTrainedConfig):
             )
         if self.recap_cfg_scale < 0.0:
             raise ValueError("recap_cfg_scale must be >= 0.")
+
+        # Auto-configure dimensions for N1.6 action head
+        if self.action_head_version == "n16":
+            if self.max_state_dim < 128:
+                self.max_state_dim = 128
+            if self.max_action_dim < 128:
+                self.max_action_dim = 128
 
         def _normalize_joint_indices(indices: list[int], name: str) -> list[int]:
             normalized: list[int] = []
