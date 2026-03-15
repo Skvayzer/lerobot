@@ -179,6 +179,9 @@ class GrootCoTConfig(PreTrainedConfig):
     # Relative actions: subtract current state from target action during training,
     # add current state back during inference
     use_relative_actions: bool = False
+    # Path to JSON with pre-computed relative action stats (min/max) for normalization.
+    # Required when use_relative_actions=true. Generate with compute_relative_action_stats.py
+    relative_action_stats_path: str | None = None
 
     # FLARE future prediction
     flare_enable: bool = False

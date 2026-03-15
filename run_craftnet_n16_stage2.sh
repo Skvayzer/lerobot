@@ -48,6 +48,8 @@ export TOKENIZERS_PARALLELISM=false
 export HF_HUB_DISABLE_XET=1
 export HF_HUB_ENABLE_HF_TRANSFER=0
 export HIPBLAS_OP_DTYPE_FP32=1
+export HIPBLASLT_TUNING_OVERRIDE=NONE
+export HIP_FORCE_DEV_KERNELS=1
 
 CACHE_ROOT=/tmp/$USER/rocm_cache_${SLURM_JOB_ID}
 mkdir -p "$CACHE_ROOT"/{miopen_db,miopen_cache,torch_kernels,xdg_cache}
@@ -89,9 +91,11 @@ accelerate launch \
   --policy.tune_top_llm_layers=4 \
   \
   --policy.use_relative_actions=true \
+  --policy.relative_action_stats_path="$LEROBOT_DIR/relative_action_stats_dex3_blockstack.json" \
   --policy.flare_enable=false \
   \
   --policy.use_bf16=false \
+  --policy.attn_implementation=eager \
   --policy.dual_rate_enable=false \
   --policy.dual_rate_apply_in_train=false \
   --policy.visual_dropout_p=0.0 \

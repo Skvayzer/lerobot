@@ -298,8 +298,25 @@ def make_pre_post_processors(
                 else "groot_cot_action_unpack_unnormalize_v1"
             )
 
+            _ds_stats = kwargs.get("dataset_stats")
+
+            # Override action stats with relative stats when applicable
+            if isinstance(policy_cfg, GrootCoTConfig) and getattr(policy_cfg, "use_relative_actions", False):
+                _rel_path = getattr(policy_cfg, "relative_action_stats_path", None)
+                if _rel_path:
+                    _p = Path(_rel_path)
+                    if _p.exists():
+                        with open(_p) as _f:
+                            _rel = json.load(_f)
+                        if "action" in _rel:
+                            _ds_stats = dict(_ds_stats or {})
+                            _ds_stats["action"] = {
+                                k: torch.tensor(v) if isinstance(v, list) else v
+                                for k, v in _rel["action"].items()
+                            }
+
             preprocessor_overrides[pack_step] = {
-                "stats": kwargs.get("dataset_stats"),
+                "stats": _ds_stats,
                 "normalize_min_max": True,
             }
 
@@ -349,7 +366,7 @@ def make_pre_post_processors(
             # Also ensure postprocessing slices to env action dim and unnormalizes with dataset stats.
             env_action_dim = policy_cfg.output_features[ACTION].shape[0]
             postprocessor_overrides[unpack_step] = {
-                "stats": kwargs.get("dataset_stats"),
+                "stats": _ds_stats,
                 "normalize_min_max": True,
                 "env_action_dim": env_action_dim,
             }

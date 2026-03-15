@@ -42,6 +42,14 @@ export TOKENIZERS_PARALLELISM=false
 export HF_HUB_DISABLE_XET=1
 export HF_HUB_ENABLE_HF_TRANSFER=0
 export HIPBLAS_OP_DTYPE_FP32=1
+export HIPBLASLT_TUNING_OVERRIDE=NONE
+export HIP_FORCE_DEV_KERNELS=1
+
+# CraftNet needs transformers >= 4.57 for Qwen3-VL
+python -c "from transformers import Qwen3VLForConditionalGeneration" 2>/dev/null || {
+    echo "Installing transformers >= 4.57 for Qwen3-VL..."
+    pip install 'transformers>=4.57.0' 2>&1 | tail -3
+}
 
 CACHE_ROOT=/tmp/$USER/rocm_cache_${SLURM_JOB_ID}
 mkdir -p "$CACHE_ROOT"/{miopen_db,miopen_cache,torch_kernels,xdg_cache}
@@ -81,6 +89,7 @@ accelerate launch \
   --policy.flare_enable=false \
   \
   --policy.use_bf16=false \
+  --policy.attn_implementation=eager \
   --policy.dual_rate_enable=false \
   --policy.dual_rate_apply_in_train=false \
   --policy.visual_dropout_p=0.0 \
@@ -89,7 +98,7 @@ accelerate launch \
   --policy.scheduler_num_decay_steps=5000 \
   --policy.scheduler_decay_lr_ratio=0.1 \
   --policy.optimizer_grad_clip_norm=1.0 \
-  --policy.optimizer_weight_decay=1e-4 \
+  --policy.optimizer_weight_decay=1e-5 \
   \
   --dataset.repo_id=unitreerobotics/G1_Dex3_BlockStacking_Dataset \
   --dataset.root="$HF_LEROBOT_HOME/unitreerobotics/G1_Dex3_BlockStacking_Dataset" \

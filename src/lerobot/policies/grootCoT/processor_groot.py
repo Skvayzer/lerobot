@@ -126,6 +126,31 @@ def make_groot_pre_post_processors(
     # Pass raw dataset_stats; normalization will occur inside pack step before padding
     padded_stats = dataset_stats or {}
 
+    # Override action stats with relative action stats when applicable
+    if getattr(config, "use_relative_actions", False):
+        _rel_path = getattr(config, "relative_action_stats_path", None)
+        if _rel_path:
+            import json as _json
+            from pathlib import Path as _Path
+            _p = _Path(_rel_path)
+            if _p.exists():
+                with open(_p) as _f:
+                    _rel_stats = _json.load(_f)
+                if "action" in _rel_stats:
+                    padded_stats = dict(padded_stats)
+                    padded_stats["action"] = {
+                        k: torch.tensor(v) if isinstance(v, list) else v
+                        for k, v in _rel_stats["action"].items()
+                    }
+                    print(f"[GROOT] Loaded relative action stats from {_rel_path}")
+                else:
+                    print(f"[GROOT] WARNING: relative_action_stats_path has no 'action' key")
+            else:
+                print(f"[GROOT] WARNING: relative_action_stats_path not found: {_rel_path}")
+        else:
+            print(f"[GROOT] WARNING: use_relative_actions=true but no relative_action_stats_path. "
+                  f"Using absolute stats (suboptimal).")
+
     # Define feature specs for optional normalization steps
     _features: dict[str, PolicyFeature] = {
         # Observation features (only add those we may normalize)
