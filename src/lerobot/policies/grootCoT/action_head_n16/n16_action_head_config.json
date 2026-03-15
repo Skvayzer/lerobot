@@ -1,0 +1,27 @@
+{
+  "backbone_embedding_dim": 2048,
+  "input_embedding_dim": 1536,
+  "hidden_size": 1024,
+  "max_state_dim": 128,
+  "max_action_dim": 128,
+  "action_horizon": 50,
+  "use_alternate_vl_dit": true,
+  "num_inference_timesteps": 4,
+  "noise_beta_alpha": 1.5,
+  "noise_beta_beta": 1.0,
+  "noise_s": 0.999,
+  "num_timestep_buckets": 1000,
+  "select_layer": 16,
+  "diffusion_model_cfg": {
+    "attention_head_dim": 48,
+    "dropout": 0.2,
+    "final_dropout": true,
+    "interleave_self_attention": true,
+    "norm_type": "ada_norm",
+    "num_attention_heads": 32,
+    "num_layers": 32,
+    "output_dim": 1024,
+    "positional_embeddings": null
+  },
+  "max_num_embodiments": 32
+}
