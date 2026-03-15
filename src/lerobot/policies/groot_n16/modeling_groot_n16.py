@@ -191,6 +191,11 @@ class GrootN16Policy(PreTrainedPolicy):
         if self.config.use_bf16:
             model = model.to(torch.bfloat16)
             model.config.model_dtype = "bfloat16"
+        else:
+            # HF checkpoint is BF16 — cast to FP32 for ROCm compatibility
+            model = model.float()
+            model.config.model_dtype = "float32"
+            print("[GrootN16] Cast model to FP32 (use_bf16=false)")
 
         self._apply_freeze_config(model)
         return model
