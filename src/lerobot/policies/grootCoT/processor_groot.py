@@ -114,9 +114,12 @@ def make_groot_pre_post_processors(
     # These should match the config used for the pretrained model
     # Default values match most GR00T configs (state_horizon=1, action_horizon=16)
     state_horizon = 1
-    # CRITICAL: Pretrained GR00T models use action_horizon=16 max!
-    # The model architecture hardcodes this limit
-    action_horizon = min(config.chunk_size, 16)
+    # N1.5 action head uses action_horizon=16 max; N1.6 uses up to 50
+    _ah_version = getattr(config, "action_head_version", "n15")
+    if _ah_version == "n16":
+        action_horizon = config.chunk_size  # N1.6 supports larger horizons
+    else:
+        action_horizon = min(config.chunk_size, 16)
     max_state_dim = config.max_state_dim
     max_action_dim = config.max_action_dim
 
@@ -176,6 +179,7 @@ def make_groot_pre_post_processors(
             ),
             dex3_missing_camera_policy=getattr(config, "dex3_missing_camera_policy", "zero_fill"),
             use_grounded_reference_frame=getattr(config, "use_grounded_reference_frame", False),
+            use_relative_actions=getattr(config, "use_relative_actions", False),
         ),
         # 4. Qwen encode (creates qwen_content)
         GrootQwenEncodeStep(
@@ -195,6 +199,7 @@ def make_groot_pre_post_processors(
             env_action_dim=env_action_dim,
             stats=padded_stats,
             normalize_min_max=True,
+            use_relative_actions=getattr(config, "use_relative_actions", False),
         ),
         # Finally, move to CPU for env interaction
         DeviceProcessorStep(device="cpu"),
@@ -340,6 +345,8 @@ class GrootPackInputsStep(ProcessorStep):
     )
     dex3_missing_camera_policy: str = "zero_fill"
     use_grounded_reference_frame: bool = False
+    # Relative actions: subtract current state from action before normalization
+    use_relative_actions: bool = False
 
     def _resolve_dex3_camera_key(self, obs: dict[str, Any], canonical_key: str) -> str | None:
         candidates = [canonical_key, *(self.dex3_camera_aliases.get(canonical_key, []))]
@@ -494,11 +501,15 @@ class GrootPackInputsStep(ProcessorStep):
         comp["language"] = lang
 
         # 3) State/state_mask -> (B, 1, max_state_dim)
+        # Save raw state for relative action computation BEFORE normalization
+        raw_state_for_relative = None
         if "observation.state" in obs:
             state = obs["observation.state"]  # (B, D)
             if state.dim() != 2:
                 raise ValueError(f"state must be (B, D), got {tuple(state.shape)}")
             bsz, d = state.shape
+            if self.use_relative_actions:
+                raw_state_for_relative = state.clone()
             # Normalize BEFORE padding
             if self.normalize_min_max:
                 state = _min_max_norm(state, "observation.state")
@@ -517,6 +528,28 @@ class GrootPackInputsStep(ProcessorStep):
         # 4) Action/action_mask -> (B, action_horizon, max_action_dim)
         action = transition.get(TransitionKey.ACTION)
         if isinstance(action, torch.Tensor):
+            # Convert to relative actions BEFORE normalization
+            if self.use_relative_actions and raw_state_for_relative is not None:
+                ref = raw_state_for_relative  # (B, D_state)
+                if action.dim() == 2:
+                    # action: (B, D_action)
+                    d_act = action.shape[-1]
+                    d_ref = ref.shape[-1]
+                    if d_ref < d_act:
+                        ref = torch.nn.functional.pad(ref, (0, d_act - d_ref))
+                    elif d_ref > d_act:
+                        ref = ref[:, :d_act]
+                    action = action - ref
+                elif action.dim() == 3:
+                    # action: (B, T, D_action)
+                    d_act = action.shape[-1]
+                    d_ref = ref.shape[-1]
+                    if d_ref < d_act:
+                        ref = torch.nn.functional.pad(ref, (0, d_act - d_ref))
+                    elif d_ref > d_act:
+                        ref = ref[:, :d_act]
+                    action = action - ref.unsqueeze(1)
+
             # Normalize BEFORE temporal expansion/padding
             if self.normalize_min_max:
                 if action.dim() == 2:
@@ -596,6 +629,7 @@ class GrootPackInputsStep(ProcessorStep):
             "dex3_camera_aliases": self.dex3_camera_aliases,
             "dex3_missing_camera_policy": self.dex3_missing_camera_policy,
             "use_grounded_reference_frame": self.use_grounded_reference_frame,
+            "use_relative_actions": self.use_relative_actions,
         }
 
     def state_dict(self) -> dict[str, torch.Tensor]:
@@ -838,6 +872,8 @@ class GrootActionUnpackUnnormalizeStep(ProcessorStep):
     # Apply inverse of min-max normalization if it was used in preprocessor
     normalize_min_max: bool = True
     stats: dict[str, dict[str, Any]] | None = None
+    # Convert relative actions back to absolute by adding current state
+    use_relative_actions: bool = False
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         # Expect model outputs to be in TransitionKey.ACTION as (B, T, D_model)
@@ -876,6 +912,22 @@ class GrootActionUnpackUnnormalizeStep(ProcessorStep):
             inv = (action + 1.0) * 0.5 * safe_denom + min_v
             action = torch.where(mask, inv, min_v)
 
+        # Convert relative actions back to absolute
+        if self.use_relative_actions:
+            obs = transition.get(TransitionKey.OBSERVATION, {}) or {}
+            current_state = obs.get("observation.state")
+            if current_state is not None and isinstance(current_state, torch.Tensor):
+                cs = current_state.to(dtype=action.dtype, device=action.device)
+                if cs.dim() == 3:
+                    cs = cs[:, -1, :]  # Take last timestep: (B, 1, D) -> (B, D)
+                d_act = action.shape[-1]
+                d_cs = cs.shape[-1]
+                if d_cs > d_act:
+                    cs = cs[:, :d_act]
+                elif d_cs < d_act:
+                    cs = torch.nn.functional.pad(cs, (0, d_act - d_cs))
+                action = action + cs
+
         transition[TransitionKey.ACTION] = action
         return transition
 
@@ -891,6 +943,7 @@ class GrootActionUnpackUnnormalizeStep(ProcessorStep):
         return {
             "env_action_dim": self.env_action_dim,
             "normalize_min_max": self.normalize_min_max,
+            "use_relative_actions": self.use_relative_actions,
         }
 
     def state_dict(self) -> dict[str, torch.Tensor]:
