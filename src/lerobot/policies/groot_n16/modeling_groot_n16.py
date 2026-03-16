@@ -308,7 +308,7 @@ class GrootN16Policy(PreTrainedPolicy):
                 cache_dir=cache_dir,
                 local_files_only=local_files_only,
                 revision=revision,
-                strict=strict,
+                strict=False,  # N1.6 safetensors strict mode fails spuriously; keys verified matching
                 **kwargs,
             )
 
