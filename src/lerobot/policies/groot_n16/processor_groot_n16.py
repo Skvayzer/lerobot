@@ -149,12 +149,19 @@ def make_groot_n16_pre_post_processors(
         DeviceProcessorStep(device=config.device),
     ]
 
+    unpack_step = GrootN16ActionUnpackUnnormalizeStep(
+        env_action_dim=env_action_dim,
+        stats=padded_stats,
+        normalize_min_max=True,
+    )
+
+    # Link pack→unpack so postprocessor can access last_raw_state for relative→absolute
+    pack_step = input_steps[3]  # GrootN16PackInputsStep
+    assert isinstance(pack_step, GrootN16PackInputsStep)
+    pack_step._linked_unpack_step = unpack_step
+
     output_steps: list[ProcessorStep] = [
-        GrootN16ActionUnpackUnnormalizeStep(
-            env_action_dim=env_action_dim,
-            stats=padded_stats,
-            normalize_min_max=True,
-        ),
+        unpack_step,
         DeviceProcessorStep(device="cpu"),
     ]
 
@@ -260,11 +267,17 @@ class GrootN16PackInputsStep(ProcessorStep):
         comp["language"] = lang
 
         # 3) State/state_mask -> (B, 1, max_state_dim)
+        self._last_raw_state = None  # for relative action conversion in training
         if OBS_STATE in obs:
             state = obs[OBS_STATE]
             if state.dim() != 2:
                 raise ValueError(f"state must be (B, D), got {tuple(state.shape)}")
             bsz, d = state.shape
+            # Save raw state for relative action conversion (before normalization)
+            self._last_raw_state = state.clone()  # (B, D) — raw joint angles
+            # Forward to linked postprocessor for inference-time relative→absolute
+            if hasattr(self, "_linked_unpack_step") and self._linked_unpack_step is not None:
+                self._linked_unpack_step.set_last_state(state.clone())
             if self.normalize_min_max:
                 state = _min_max_norm(state, OBS_STATE)
             state = state.unsqueeze(1)  # (B, 1, D)
@@ -280,8 +293,22 @@ class GrootN16PackInputsStep(ProcessorStep):
             obs["state_mask"] = state_mask
 
         # 4) Action/action_mask -> (B, action_horizon, max_action_dim)
+        #    N1.6 uses relative actions: action_rel[t] = action_abs[t] - last_state
+        #    where last_state = state[:, -1, :env_dim] (before padding/normalization)
         action = transition.get(TransitionKey.ACTION)
         if isinstance(action, torch.Tensor):
+            # Convert absolute actions to relative using last observed state
+            if OBS_STATE in obs and "state" in obs:
+                # obs["state"] is already (B, 1, max_state_dim) and normalized at this point.
+                # We need the RAW (un-normalized) last state. We saved it above.
+                pass
+            if hasattr(self, "_last_raw_state") and self._last_raw_state is not None:
+                last_state = self._last_raw_state  # (B, D) raw joint angles
+                if action.dim() == 2:
+                    action = action - last_state  # (B, D) - (B, D)
+                elif action.dim() == 3:
+                    action = action - last_state.unsqueeze(1)  # (B, T, D) - (B, 1, D)
+
             if self.normalize_min_max:
                 if action.dim() == 2:
                     action = _min_max_norm(action, ACTION)
@@ -518,11 +545,16 @@ class GrootN16EagleCollateStep(ProcessorStep):
 @dataclass
 @ProcessorStepRegistry.register(name="groot_n16_action_unpack_v1")
 class GrootN16ActionUnpackUnnormalizeStep(ProcessorStep):
-    """Slice and unnormalize N1.6 action predictions."""
+    """Slice, unnormalize, and convert relative→absolute for N1.6 action predictions."""
 
     env_action_dim: int = 0
     normalize_min_max: bool = True
     stats: dict[str, dict[str, Any]] | None = None
+    _last_raw_state: torch.Tensor | None = field(default=None, init=False, repr=False)
+
+    def set_last_state(self, raw_state: torch.Tensor) -> None:
+        """Store the last observed raw state for relative→absolute conversion at inference."""
+        self._last_raw_state = raw_state
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         action = transition.get(TransitionKey.ACTION)
@@ -554,6 +586,16 @@ class GrootN16ActionUnpackUnnormalizeStep(ProcessorStep):
             safe_denom = torch.where(mask, denom, torch.ones_like(denom))
             inv = (action + 1.0) * 0.5 * safe_denom + min_v
             action = torch.where(mask, inv, min_v)
+
+        # Convert relative action back to absolute: action_abs = action_rel + last_state
+        if self._last_raw_state is not None:
+            last_state = self._last_raw_state.to(device=action.device, dtype=action.dtype)
+            if last_state.dim() == 2 and action.dim() == 2:
+                d = min(action.shape[-1], last_state.shape[-1])
+                action[..., :d] = action[..., :d] + last_state[..., :d]
+            elif last_state.dim() == 1 and action.dim() == 1:
+                d = min(action.shape[-1], last_state.shape[-1])
+                action[:d] = action[:d] + last_state[:d]
 
         transition[TransitionKey.ACTION] = action
         return transition
