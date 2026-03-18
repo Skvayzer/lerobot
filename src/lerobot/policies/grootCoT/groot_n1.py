@@ -1249,7 +1249,7 @@ class GR00TN15(PreTrainedModel):
         # only inside action_head_cfg (fresh configs).
         self.action_horizon = getattr(
             config, "action_horizon",
-            config.action_head_cfg.get("action_horizon", config.chunk_size)
+            config.action_head_cfg.get("action_horizon", getattr(config, "chunk_size", 16))
         )
         _ah_version = getattr(config, "action_head_version", "n15")
         if _ah_version == "n16":
