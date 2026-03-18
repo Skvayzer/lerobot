@@ -164,6 +164,14 @@ class GrootCoTPolicy(PreTrainedPolicy):
         model.compute_dtype = "bfloat16" if self.config.use_bf16 else model.compute_dtype
         model.config.compute_dtype = model.compute_dtype
 
+        # Stage 1: cast frozen Qwen to FP16 immediately to halve memory before DDP.
+        # This must happen here (not at forward time) to avoid OOM during model loading.
+        if train_projector_only and hasattr(model, "backbone"):
+            _backbone = model.backbone
+            if hasattr(_backbone, "qwen_model"):
+                _backbone.qwen_model.half()
+                print("[GROOT] Stage 1: cast frozen Qwen to FP16 at init (saves ~16GB per GPU)")
+
         return model
 
     def _get_extra_observation_dims(self) -> dict[str, int]:
