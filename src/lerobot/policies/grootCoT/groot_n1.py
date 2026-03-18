@@ -1140,9 +1140,10 @@ class GR00TN15(PreTrainedModel):
         _ah_version = getattr(config, "action_head_version", "n15")
         if _ah_version == "n16":
             _ah_cfg = dict(config.action_head_cfg)
-            _ah_cfg.setdefault("backbone_embedding_dim", 2048)
-            _ah_cfg.setdefault("max_state_dim", 128)
-            _ah_cfg.setdefault("max_action_dim", 128)
+            # Force N1.6 dimensions (override N1.5 defaults)
+            _ah_cfg["backbone_embedding_dim"] = 2048
+            _ah_cfg["max_state_dim"] = 128
+            _ah_cfg["max_action_dim"] = 128
             _ah_cfg.setdefault("action_horizon", getattr(config, "chunk_size", 50))
             config.action_head_cfg = _ah_cfg
             print(f"[GROOT] N1.6 action head: backbone_dim={_ah_cfg['backbone_embedding_dim']}, "
