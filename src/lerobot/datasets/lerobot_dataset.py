@@ -1494,6 +1494,49 @@ class LeRobotDataset(torch.utils.data.Dataset):
             )
             return _clone_item_tensors(self._last_valid_item)
 
+        # Emergency fallback: try loading index 0 as a last resort before crashing.
+        # This handles the case where the first batch on a DDP rank hits only bad
+        # episodes and _last_valid_item was never populated.
+        logging.error(
+            "No cached fallback sample available (start_idx=%d, repo_id=%s). "
+            "Attempting emergency load from index 0 to avoid crashing training.",
+            original_idx,
+            self.repo_id,
+        )
+        for emergency_idx in range(min(100, len(self))):
+            try:
+                item = self.hf_dataset[emergency_idx]
+                ep_idx = item["episode_index"].item()
+                abs_idx = item["index"].item()
+                query_indices = None
+                if self.delta_indices is not None:
+                    query_indices, padding = self._get_query_indices(abs_idx, ep_idx)
+                    query_result = self._query_hf_dataset(query_indices)
+                    item = {**item, **padding}
+                    for key, val in query_result.items():
+                        item[key] = val
+                if len(self.meta.video_keys) > 0:
+                    current_ts = item["timestamp"].item()
+                    query_timestamps = self._get_query_timestamps(current_ts, query_indices)
+                    video_frames = self._query_videos(query_timestamps, ep_idx)
+                    item = {**video_frames, **item}
+                if self.image_transforms is not None:
+                    for cam in self.meta.camera_keys:
+                        item[cam] = self.image_transforms(item[cam])
+                task_idx = item["task_index"].item()
+                item["task"] = self.meta.tasks.iloc[task_idx].name
+                if "subtask_index" in self.features and self.meta.subtasks is not None:
+                    subtask_idx = item["subtask_index"].item()
+                    item["subtask"] = self.meta.subtasks.iloc[subtask_idx].name
+                self._last_valid_item = item
+                logging.error(
+                    "Emergency fallback succeeded at index %d. Training will continue.",
+                    emergency_idx,
+                )
+                return item
+            except Exception:
+                continue
+
         raise RuntimeError(
             f"Failed to fetch a valid sample after {max_attempts} attempts "
             f"(start_idx={original_idx}, repo_id={self.repo_id})."
