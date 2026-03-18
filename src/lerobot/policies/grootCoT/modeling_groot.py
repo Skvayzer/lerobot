@@ -840,8 +840,16 @@ class GrootCoTPolicy(PreTrainedPolicy):
             else:
                 _projector_only = getattr(self.config, "train_vlm_projector_only", False)
                 if _projector_only:
-                    # Stage 1: Qwen is fully frozen. Run backbone under no_grad
-                    # to avoid storing activation tensors for 36 LLM layers (~15-20GB).
+                    # Stage 1: Qwen is fully frozen.
+                    # 1. Cast Qwen to FP16 for forward pass (saves ~16GB per GPU).
+                    #    MI210 can't do BF16 but FP16 is fine for inference-only.
+                    # 2. Run under no_grad to skip activation storage (~15-20GB saved).
+                    if not getattr(self, "_qwen_cast_to_fp16", False):
+                        backbone = self._groot_model.backbone
+                        if hasattr(backbone, "qwen_model"):
+                            backbone.qwen_model.half()
+                            print("[GROOT] Stage 1: cast frozen Qwen to FP16 for memory savings")
+                            self._qwen_cast_to_fp16 = True
                     with torch.no_grad():
                         backbone_outputs = self._groot_model.run_backbone(groot_inputs)
                     # Detach backbone features so gradients don't flow into Qwen.
