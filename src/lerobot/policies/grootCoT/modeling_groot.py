@@ -830,7 +830,23 @@ class GrootCoTPolicy(PreTrainedPolicy):
                     fresh_visual_features=fresh_visual,
                 )
             else:
-                outputs = self._groot_model.forward(groot_inputs)
+                _projector_only = getattr(self.config, "train_vlm_projector_only", False)
+                if _projector_only:
+                    # Stage 1: Qwen is fully frozen. Run backbone under no_grad
+                    # to avoid storing activation tensors for 36 LLM layers (~15-20GB).
+                    with torch.no_grad():
+                        backbone_outputs = self._groot_model.run_backbone(groot_inputs)
+                    # Detach backbone features so gradients don't flow into Qwen.
+                    for k in list(backbone_outputs.keys()):
+                        if isinstance(backbone_outputs[k], torch.Tensor) and backbone_outputs[k].requires_grad:
+                            backbone_outputs[k] = backbone_outputs[k].detach().requires_grad_(True)
+                    outputs = self._groot_model.run_action_head(
+                        inputs=groot_inputs,
+                        backbone_outputs=backbone_outputs,
+                        is_training=True,
+                    )
+                else:
+                    outputs = self._groot_model.forward(groot_inputs)
 
         self._train_forward_step += 1
 

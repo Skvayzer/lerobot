@@ -1263,6 +1263,13 @@ class GR00TN15(PreTrainedModel):
         # NOTE -- this should be handled internally by the model
         # however, doing that will likely be breaking changes -- so we'll need to do it after the deadline
 
+        # Skip validation for N1.6 action head: the base GR00TN15Config has
+        # action_dim=32/action_horizon=16 but N1.6 uses max_action_dim=128/action_horizon=50.
+        # The mismatch causes false validation failures.
+        _ah_version = getattr(self.config, "action_head_version", "n15")
+        if _ah_version == "n16":
+            return
+
         detected_error = False
         error_msg = ERROR_MSG
         if "action" in inputs:
