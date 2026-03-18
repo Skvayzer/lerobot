@@ -1245,7 +1245,14 @@ class GR00TN15(PreTrainedModel):
             self.action_head = FlowmatchingActionHead(action_head_cfg, lora_config=ah_lora_cfg)
 
         self.action_horizon = config.action_horizon
-        self.action_dim = config.action_dim
+        # N1.6 pads actions to max_action_dim; use that for validation.
+        # config.action_dim may reflect the dataset's native dim (e.g., 28)
+        # which is smaller than the padded dim the processor produces.
+        _ah_version = getattr(config, "action_head_version", "n15")
+        if _ah_version == "n16":
+            self.action_dim = config.max_action_dim
+        else:
+            self.action_dim = config.action_dim
         self.compute_dtype = config.compute_dtype
 
     def validate_inputs(self, inputs):
