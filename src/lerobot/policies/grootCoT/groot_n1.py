@@ -1280,7 +1280,10 @@ class GR00TN15(PreTrainedModel):
                     and action.shape[2] == self.action_dim
                 )
                 if not shape_ok:
-                    error_msg += f"\n{action.shape=}"
+                    error_msg += (
+                        f"\n{action.shape=}"
+                        f"\nexpected: (B, {self.action_horizon}, {self.action_dim})"
+                    )
                     detected_error = True
             else:
                 # Unexpected non-tensor type provided for action
