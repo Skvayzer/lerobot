@@ -1210,9 +1210,9 @@ class GR00TN15(PreTrainedModel):
             )
             _n16_cfg = N16ActionHeadConfig(
                 backbone_embedding_dim=config.action_head_cfg.get("backbone_embedding_dim", 2048),
-                max_state_dim=config.action_head_cfg.get("max_state_dim", config.max_state_dim),
-                max_action_dim=config.action_head_cfg.get("max_action_dim", config.max_action_dim),
-                action_horizon=config.action_head_cfg.get("action_horizon", config.chunk_size),
+                max_state_dim=config.action_head_cfg.get("max_state_dim", getattr(config, "max_state_dim", 128)),
+                max_action_dim=config.action_head_cfg.get("max_action_dim", getattr(config, "max_action_dim", 128)),
+                action_horizon=config.action_head_cfg.get("action_horizon", getattr(config, "chunk_size", 50)),
                 tune_projector=getattr(config, "tune_projector", True),
                 tune_diffusion_model=getattr(config, "tune_diffusion_model", True),
                 tune_vlln=getattr(config, "tune_vlln", True),
