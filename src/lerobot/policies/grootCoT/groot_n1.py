@@ -1252,13 +1252,14 @@ class GR00TN15(PreTrainedModel):
             config.action_head_cfg.get("action_horizon", getattr(config, "chunk_size", 16))
         )
         _ah_version = getattr(config, "action_head_version", "n15")
+        _max_adim = getattr(config, "max_action_dim", getattr(config, "action_dim", 32))
         if _ah_version == "n16":
             # N1.6 pads actions to max_action_dim (128); use that for validation.
-            self.action_dim = config.max_action_dim
+            self.action_dim = _max_adim
         else:
             self.action_dim = getattr(
                 config, "action_dim",
-                config.action_head_cfg.get("action_dim", config.max_action_dim)
+                config.action_head_cfg.get("action_dim", _max_adim)
             )
         self.compute_dtype = config.compute_dtype
 
