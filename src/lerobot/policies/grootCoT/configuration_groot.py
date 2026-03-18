@@ -105,11 +105,12 @@ class GrootCoTConfig(PreTrainedConfig):
             "observation.images.cam_right_high",
             "observation.images.cam_left_wrist",
             "observation.images.cam_right_wrist",
-            "observation.images.depth_cam_left_high",
-            "observation.images.depth_cam_left_wrist",
-            "observation.images.depth_cam_right_wrist",
         ]
     )
+    # Depth cameras to add when depth metadata is available in the dataset:
+    # "observation.images.depth_cam_left_high",
+    # "observation.images.depth_cam_left_wrist",
+    # "observation.images.depth_cam_right_wrist",
     # Missing-view policy for canonical Dex3 camera packing.
     # - "zero_fill": substitute missing camera with a zero image tensor.
     # - "error": fail fast if any canonical camera is missing.
