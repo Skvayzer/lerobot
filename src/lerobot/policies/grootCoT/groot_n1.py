@@ -1144,7 +1144,7 @@ class GR00TN15(PreTrainedModel):
             _ah_cfg["backbone_embedding_dim"] = 2048
             _ah_cfg["max_state_dim"] = 128
             _ah_cfg["max_action_dim"] = 128
-            _ah_cfg.setdefault("action_horizon", getattr(config, "chunk_size", 50))
+            _ah_cfg["action_horizon"] = getattr(config, "chunk_size", 50)
             config.action_head_cfg = _ah_cfg
             print(f"[GROOT] N1.6 action head: backbone_dim={_ah_cfg['backbone_embedding_dim']}, "
                   f"state_dim={_ah_cfg['max_state_dim']}, action_dim={_ah_cfg['max_action_dim']}, "
@@ -1796,8 +1796,12 @@ class GR00TN15(PreTrainedModel):
                 "target_modules": action_head_lora_target_modules,
             }
 
+        # For N1.6, ignore size mismatches in action head (N1.5 checkpoint has
+        # different dims than N1.6). The N1.6 weights are loaded separately.
+        _ignore_mismatched = action_head_version == "n16"
         pretrained_model = super().from_pretrained(
-            local_model_path, config=config, local_model_path=local_model_path, **kwargs
+            local_model_path, config=config, local_model_path=local_model_path,
+            ignore_mismatched_sizes=_ignore_mismatched, **kwargs
         )
 
         # Detect and fix corrupted QwenBackbone weights caused by HuggingFace's
