@@ -1216,6 +1216,9 @@ class GR00TN15(PreTrainedModel):
                 tune_projector=getattr(config, "tune_projector", True),
                 tune_diffusion_model=getattr(config, "tune_diffusion_model", True),
                 tune_vlln=getattr(config, "tune_vlln", True),
+                ik_prior_prob=getattr(config, "ik_prior_prob", 0.0),
+                ik_prior_noise_scale=getattr(config, "ik_prior_noise_scale", 0.15),
+                ik_prior_arm_dim=getattr(config, "ik_prior_arm_dim", 14),
             )
             self.action_head = Gr00tN1d6ActionHead(_n16_cfg)
             _weights_path = getattr(config, "n16_action_head_weights_path", None)

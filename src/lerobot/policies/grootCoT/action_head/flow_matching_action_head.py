@@ -169,6 +169,20 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
     upper_body_loss_weight: float = field(default=1.0)
     lower_body_loss_weight: float = field(default=0.0)
 
+    # IK prior source distribution settings
+    ik_prior_prob: float = field(
+        default=0.4,
+        metadata={"help": "Probability of using IK-like linear prior instead of Gaussian noise for arm joints during training. 0.0 disables."}
+    )
+    ik_prior_noise_scale: float = field(
+        default=0.15,
+        metadata={"help": "Scale of Gaussian noise added to the linear arm prior. Prevents x_0 == x_1."}
+    )
+    ik_prior_arm_dim: int = field(
+        default=14,
+        metadata={"help": "Number of leading action dimensions treated as arm joints for IK prior. Dex3 G1 = 14 (7 left + 7 right arm)."}
+    )
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         for key, value in kwargs.items():
@@ -474,6 +488,63 @@ class FlowmatchingActionHead(nn.Module):
         sample = dist.sample([batch_size]).to(device=device, dtype=dtype)
         return (self.config.noise_s - sample) / self.config.noise_s
 
+    def _sample_source(self, actions: torch.Tensor) -> torch.Tensor:
+        """
+        Sample the source distribution x_0 for flow matching.
+
+        With probability ik_prior_prob (per sample in batch):
+          - Arm dims (0:arm_dim): linear interpolation from first to last
+            action in chunk + Gaussian noise
+          - Finger dims (arm_dim:): standard Gaussian noise
+
+        With probability (1 - ik_prior_prob):
+          - All dims: standard Gaussian noise (standard flow matching)
+
+        Args:
+            actions: (B, H, D) ground truth action chunk (normalized)
+
+        Returns:
+            x_0: (B, H, D) source samples
+        """
+        B, H, D = actions.shape
+        device = actions.device
+        dtype = actions.dtype
+        arm_dim = min(self.config.ik_prior_arm_dim, D)
+        p_prior = self.config.ik_prior_prob
+        noise_scale = self.config.ik_prior_noise_scale
+
+        # Start with standard Gaussian noise for everything
+        x_0 = torch.randn(B, H, D, device=device, dtype=dtype)
+
+        # Skip if disabled or not training
+        if p_prior <= 0 or not self.training or arm_dim <= 0:
+            return x_0
+
+        # Per-sample mask: which samples get the IK prior
+        use_prior = (torch.rand(B, device=device) < p_prior)  # (B,)
+        if not use_prior.any():
+            return x_0
+
+        # Compute linear interpolation for arm dimensions
+        arm_start = actions[:, 0:1, :arm_dim]   # (B, 1, arm_dim)
+        arm_end = actions[:, -1:, :arm_dim]      # (B, 1, arm_dim)
+
+        # Interpolation coefficients
+        alphas = torch.linspace(0, 1, H, device=device, dtype=dtype)
+        alphas = alphas.view(1, H, 1)  # (1, H, 1) for broadcasting
+
+        # Linear prior: straight line in joint space from start to end
+        arm_linear = arm_start + alphas * (arm_end - arm_start)  # (B, H, arm_dim)
+
+        # Add noise to prevent degeneracy (x_0 too close to x_1)
+        arm_prior = arm_linear + noise_scale * torch.randn_like(arm_linear)
+
+        # Apply: replace arm dims of x_0 where use_prior is True
+        prior_mask = use_prior.view(B, 1, 1).expand(B, H, arm_dim)
+        x_0[:, :, :arm_dim] = torch.where(prior_mask, arm_prior, x_0[:, :, :arm_dim])
+
+        return x_0
+
     def prepare_input(self, batch: dict) -> BatchFeature:
         return BatchFeature(data=batch)
 
@@ -568,12 +639,15 @@ class FlowmatchingActionHead(nn.Module):
 
         # Embed noised action trajectory.
         actions = action_input.action
-        noise = torch.randn(actions.shape, device=actions.device, dtype=actions.dtype)
+
+        # Sample source distribution: IK-like prior for arm joints OR Gaussian noise
+        x_0 = self._sample_source(actions)
+
         t = self.sample_time(actions.shape[0], device=actions.device, dtype=actions.dtype)
         t = t[:, None, None]  # shape (B,1,1) for broadcast
 
-        noisy_trajectory = (1 - t) * noise + t * actions
-        velocity = actions - noise
+        noisy_trajectory = (1 - t) * x_0 + t * actions
+        velocity = actions - x_0
 
         # Convert (continuous) t -> discrete if needed
         t_discretized = (t[:, 0, 0] * self.num_timestep_buckets).long()
@@ -676,14 +750,36 @@ class FlowmatchingActionHead(nn.Module):
         if extra_state_features is not None:
             state_features = state_features + extra_state_features
 
-        # Set initial actions as the sampled noise.
+        # Set initial actions: IK trajectory if provided, else sampled noise.
         batch_size = vl_embs.shape[0]
         device = vl_embs.device
-        actions = torch.randn(
-            size=(batch_size, self.config.action_horizon, self.config.action_dim),
-            dtype=vl_embs.dtype,
-            device=device,
-        )
+
+        ik_trajectory = action_input.get("ik_trajectory", None)
+
+        if ik_trajectory is not None:
+            # SDEdit-style: use IK trajectory for arm dims, noise for fingers
+            arm_dim = min(self.config.ik_prior_arm_dim, self.config.action_dim)
+            actions = torch.randn(
+                size=(batch_size, self.config.action_horizon, self.config.action_dim),
+                dtype=vl_embs.dtype,
+                device=device,
+            )
+            # Overwrite arm dimensions with the IK trajectory
+            ik_traj = ik_trajectory.to(device=device, dtype=vl_embs.dtype)
+            if ik_traj.shape[1] != self.config.action_horizon:
+                ik_traj = torch.nn.functional.interpolate(
+                    ik_traj.permute(0, 2, 1),
+                    size=self.config.action_horizon,
+                    mode='linear',
+                    align_corners=True,
+                ).permute(0, 2, 1)
+            actions[:, :, :arm_dim] = ik_traj[:, :, :arm_dim]
+        else:
+            actions = torch.randn(
+                size=(batch_size, self.config.action_horizon, self.config.action_dim),
+                dtype=vl_embs.dtype,
+                device=device,
+            )
 
         num_steps = self.num_inference_timesteps
         dt = 1.0 / num_steps

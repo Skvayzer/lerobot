@@ -46,6 +46,12 @@ class N16ActionHeadConfig:
     tune_diffusion_model: bool = True
     tune_vlln: bool = True
     attn_dropout: float = 0.2
+
+    # IK prior source distribution settings
+    ik_prior_prob: float = 0.0
+    ik_prior_noise_scale: float = 0.15
+    ik_prior_arm_dim: int = 14
+
     diffusion_model_cfg: dict = field(default_factory=lambda: {
         "positional_embeddings": None,
         "num_layers": 32,
@@ -170,6 +176,35 @@ class Gr00tN1d6ActionHead(nn.Module):
         sample = (1 - sample) * self.config.noise_s
         return sample
 
+    def _sample_source(self, actions: torch.Tensor) -> torch.Tensor:
+        """Sample source distribution x_0: IK linear prior for arm joints OR Gaussian noise."""
+        B, H, D = actions.shape
+        device = actions.device
+        dtype = actions.dtype
+        arm_dim = min(self.config.ik_prior_arm_dim, D)
+        p_prior = self.config.ik_prior_prob
+        noise_scale = self.config.ik_prior_noise_scale
+
+        x_0 = torch.randn(B, H, D, device=device, dtype=dtype)
+
+        if p_prior <= 0 or not self.training or arm_dim <= 0:
+            return x_0
+
+        use_prior = (torch.rand(B, device=device) < p_prior)
+        if not use_prior.any():
+            return x_0
+
+        arm_start = actions[:, 0:1, :arm_dim]
+        arm_end = actions[:, -1:, :arm_dim]
+        alphas = torch.linspace(0, 1, H, device=device, dtype=dtype).view(1, H, 1)
+        arm_linear = arm_start + alphas * (arm_end - arm_start)
+        arm_prior = arm_linear + noise_scale * torch.randn_like(arm_linear)
+
+        prior_mask = use_prior.view(B, 1, 1).expand(B, H, arm_dim)
+        x_0[:, :, :arm_dim] = torch.where(prior_mask, arm_prior, x_0[:, :, :arm_dim])
+
+        return x_0
+
     def process_backbone_output(self, backbone_output: BatchFeature) -> BatchFeature:
         backbone_features = backbone_output["backbone_features"]
         backbone_features = self.vlln(backbone_features)
@@ -212,14 +247,14 @@ class Gr00tN1d6ActionHead(nn.Module):
             noise = torch.randn_like(state_features) * self.state_additive_noise_scale
             state_features = state_features + noise
 
-        # Flow matching: noise actions
+        # Flow matching: sample source distribution
         actions = action_input.action
-        noise = torch.randn(actions.shape, device=actions.device, dtype=actions.dtype)
+        x_0 = self._sample_source(actions)
         t = self.sample_time(actions.shape[0], device=actions.device, dtype=actions.dtype)
         t = t[:, None, None]
 
-        noisy_trajectory = (1 - t) * noise + t * actions
-        velocity = actions - noise
+        noisy_trajectory = (1 - t) * x_0 + t * actions
+        velocity = actions - x_0
 
         t_discretized = (t[:, 0, 0] * self.num_timestep_buckets).long()
         action_features = self.action_encoder(noisy_trajectory, t_discretized, embodiment_id)
@@ -284,16 +319,35 @@ class Gr00tN1d6ActionHead(nn.Module):
         state_features: torch.Tensor,
         embodiment_id: torch.Tensor,
         backbone_output: BatchFeature,
+        ik_trajectory: torch.Tensor | None = None,
     ) -> BatchFeature:
         """Generate actions via flow matching denoising."""
         vl_embeds = backbone_features
         batch_size = vl_embeds.shape[0]
         device = vl_embeds.device
-        actions = torch.randn(
-            size=(batch_size, self.config.action_horizon, self.action_dim),
-            dtype=vl_embeds.dtype,
-            device=device,
-        )
+
+        if ik_trajectory is not None:
+            arm_dim = min(self.config.ik_prior_arm_dim, self.action_dim)
+            actions = torch.randn(
+                size=(batch_size, self.config.action_horizon, self.action_dim),
+                dtype=vl_embeds.dtype,
+                device=device,
+            )
+            ik_traj = ik_trajectory.to(device=device, dtype=vl_embeds.dtype)
+            if ik_traj.shape[1] != self.config.action_horizon:
+                ik_traj = torch.nn.functional.interpolate(
+                    ik_traj.permute(0, 2, 1),
+                    size=self.config.action_horizon,
+                    mode='linear',
+                    align_corners=True,
+                ).permute(0, 2, 1)
+            actions[:, :, :arm_dim] = ik_traj[:, :, :arm_dim]
+        else:
+            actions = torch.randn(
+                size=(batch_size, self.config.action_horizon, self.action_dim),
+                dtype=vl_embeds.dtype,
+                device=device,
+            )
 
         dt = 1.0 / self.num_inference_timesteps
 

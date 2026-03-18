@@ -105,6 +105,9 @@ class GrootCoTConfig(PreTrainedConfig):
             "observation.images.cam_right_high",
             "observation.images.cam_left_wrist",
             "observation.images.cam_right_wrist",
+            "observation.images.depth_cam_left_high",
+            "observation.images.depth_cam_left_wrist",
+            "observation.images.depth_cam_right_wrist",
         ]
     )
     # Missing-view policy for canonical Dex3 camera packing.
@@ -175,6 +178,11 @@ class GrootCoTConfig(PreTrainedConfig):
     action_head_version: str = "n15"
     # Path to extracted N1.6 action head pretrained weights (.pt file)
     n16_action_head_weights_path: str | None = None
+
+    # IK prior source distribution for flow matching training
+    ik_prior_prob: float = 0.0  # 0.0 = disabled (standard noise), 0.4 = recommended for Stage 2
+    ik_prior_noise_scale: float = 0.15
+    ik_prior_arm_dim: int = 14  # first 14 dims = arm joints for G1
 
     # Relative actions: subtract current state from target action during training,
     # add current state back during inference
