@@ -1265,10 +1265,13 @@ class GR00TN15(PreTrainedModel):
 
         # Skip validation for N1.6 action head: the base GR00TN15Config has
         # action_dim=32/action_horizon=16 but N1.6 uses max_action_dim=128/action_horizon=50.
-        # The mismatch causes false validation failures.
-        _ah_version = getattr(self.config, "action_head_version", "n15")
-        if _ah_version == "n16":
-            return
+        # Check by action head class since self.config is GR00TN15Config (no action_head_version).
+        try:
+            from lerobot.policies.grootCoT.action_head_n16.gr00t_n1d6_action_head import Gr00tN1d6ActionHead
+            if isinstance(self.action_head, Gr00tN1d6ActionHead):
+                return
+        except ImportError:
+            pass
 
         detected_error = False
         error_msg = ERROR_MSG
