@@ -125,6 +125,70 @@ def get_safe_default_codec():
         return "pyav"
 
 
+def decode_video_frames_by_index(
+    video_path: Path | str,
+    timestamps: list[float],
+    tolerance_s: float,
+) -> torch.Tensor:
+    """Decode video frames by frame index instead of timestamp.
+
+    Converts timestamps to frame indices via fps, then decodes each frame
+    by seeking to its index. This bypasses timestamp metadata issues where
+    the stored PTS values don't match the expected timestamps (common in
+    datasets with AV1/chunked video files).
+
+    This matches how Isaac-GR00T's native loader decodes frames.
+    """
+    import av
+
+    video_path = str(video_path)
+    container = av.open(video_path)
+    stream = container.streams.video[0]
+    fps = float(stream.average_rate)
+    total_frames = stream.frames
+
+    # Convert timestamps to frame indices
+    frame_indices = [round(ts * fps) for ts in timestamps]
+    # Clamp to valid range
+    frame_indices = [max(0, min(idx, total_frames - 1)) for idx in frame_indices]
+
+    frames = []
+    for target_idx in frame_indices:
+        # Seek to the target frame by PTS computed from frame index
+        target_pts = int(target_idx * stream.time_base.denominator / (fps * stream.time_base.numerator))
+        container.seek(target_pts, stream=stream, any_frame=False)
+
+        # Decode until we reach the target frame
+        found = False
+        for frame in container.decode(stream):
+            frame_num = frame.pts * stream.time_base.numerator * fps / stream.time_base.denominator
+            frame_num = round(frame_num)
+            if frame_num >= target_idx:
+                img = frame.to_ndarray(format="rgb24")
+                frames.append(torch.from_numpy(img).permute(2, 0, 1))  # (C, H, W)
+                found = True
+                break
+        if not found:
+            # Fallback: seek to beginning and decode sequentially
+            container.seek(0, stream=stream)
+            for i, frame in enumerate(container.decode(stream)):
+                if i >= target_idx:
+                    img = frame.to_ndarray(format="rgb24")
+                    frames.append(torch.from_numpy(img).permute(2, 0, 1))
+                    found = True
+                    break
+        if not found:
+            raise RuntimeError(
+                f"Could not decode frame {target_idx} from {video_path} "
+                f"(total_frames={total_frames}, fps={fps})"
+            )
+
+    container.close()
+
+    result = torch.stack(frames).float() / 255.0
+    return result
+
+
 def decode_video_frames(
     video_path: Path | str,
     timestamps: list[float],
@@ -150,7 +214,12 @@ def decode_video_frames(
     if backend == "torchcodec":
         return decode_video_frames_torchcodec(video_path, timestamps, tolerance_s)
     elif backend in ["pyav", "video_reader"]:
-        return decode_video_frames_torchvision(video_path, timestamps, tolerance_s, backend)
+        # Try timestamp-based decoding first; fall back to frame-index decoding
+        # if timestamps are misaligned (common with AV1/chunked video datasets).
+        try:
+            return decode_video_frames_torchvision(video_path, timestamps, tolerance_s, backend)
+        except FrameTimestampError:
+            return decode_video_frames_by_index(video_path, timestamps, tolerance_s)
     else:
         raise ValueError(f"Unsupported video backend: {backend}")
 
