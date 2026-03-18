@@ -1855,6 +1855,16 @@ class GR00TN15(PreTrainedModel):
             else:
                 print("[GROOT] WARNING: Could not locate ViT patch_embed.proj for weight check.", flush=True)
 
+        # Re-load N1.6 action head weights after from_pretrained (which overwrites
+        # them with randomly-initialized garbage due to ignore_mismatched_sizes=True).
+        if action_head_version == "n16" and n16_action_head_weights_path:
+            from lerobot.policies.grootCoT.action_head_n16.gr00t_n1d6_action_head import Gr00tN1d6ActionHead
+            if isinstance(pretrained_model.action_head, Gr00tN1d6ActionHead):
+                _weights = torch.load(n16_action_head_weights_path, map_location="cpu")
+                _missing, _unexpected = pretrained_model.action_head.load_state_dict(_weights, strict=False)
+                print(f"[GROOT] Re-loaded N1.6 action head after from_pretrained: "
+                      f"{len(_weights)} keys, missing={len(_missing)}, unexpected={len(_unexpected)}")
+
         # Legacy heavy safety path (kept for backward compat, now superceded by in-place fix above).
         force_backbone_reinit = os.getenv("GROOT_FORCE_BACKBONE_REINIT", "0").strip() == "1"
         if (
