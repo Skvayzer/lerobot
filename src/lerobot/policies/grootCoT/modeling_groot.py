@@ -147,6 +147,7 @@ class GrootCoTPolicy(PreTrainedPolicy):
             # N1.6 action head
             action_head_version=getattr(self.config, "action_head_version", "n15"),
             n16_action_head_weights_path=getattr(self.config, "n16_action_head_weights_path", None),
+            chunk_size=self.config.chunk_size,
             # IK prior
             ik_prior_prob=getattr(self.config, "ik_prior_prob", 0.0),
             ik_prior_noise_scale=getattr(self.config, "ik_prior_noise_scale", 0.15),

@@ -1144,7 +1144,8 @@ class GR00TN15(PreTrainedModel):
             _ah_cfg["backbone_embedding_dim"] = 2048
             _ah_cfg["max_state_dim"] = 128
             _ah_cfg["max_action_dim"] = 128
-            _ah_cfg["action_horizon"] = getattr(config, "chunk_size", 50)
+            _ah_cfg["action_horizon"] = getattr(config, "chunk_size",
+                                                getattr(config, "action_horizon", 16))
             config.action_head_cfg = _ah_cfg
             print(f"[GROOT] N1.6 action head: backbone_dim={_ah_cfg['backbone_embedding_dim']}, "
                   f"state_dim={_ah_cfg['max_state_dim']}, action_dim={_ah_cfg['max_action_dim']}, "
@@ -1566,6 +1567,7 @@ class GR00TN15(PreTrainedModel):
         # N1.6 action head
         action_head_version = kwargs.pop("action_head_version", "n15")
         n16_action_head_weights_path = kwargs.pop("n16_action_head_weights_path", None)
+        chunk_size = kwargs.pop("chunk_size", 16)
         ik_prior_prob = kwargs.pop("ik_prior_prob", 0.0)
         ik_prior_noise_scale = kwargs.pop("ik_prior_noise_scale", 0.15)
         ik_prior_arm_dim = kwargs.pop("ik_prior_arm_dim", 14)
@@ -1664,6 +1666,7 @@ class GR00TN15(PreTrainedModel):
         # N1.6 action head config
         config.action_head_version = action_head_version
         config.n16_action_head_weights_path = n16_action_head_weights_path
+        config.chunk_size = chunk_size
         config.ik_prior_prob = ik_prior_prob
         config.ik_prior_noise_scale = ik_prior_noise_scale
         config.ik_prior_arm_dim = ik_prior_arm_dim
