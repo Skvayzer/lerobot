@@ -1244,20 +1244,17 @@ class GR00TN15(PreTrainedModel):
                  }
             self.action_head = FlowmatchingActionHead(action_head_cfg, lora_config=ah_lora_cfg)
 
-        # Resolve action_horizon and action_dim from config or action_head_cfg.
-        # These may live on the config object directly (pretrained models) or
-        # only inside action_head_cfg (fresh configs).
-        self.action_horizon = getattr(
-            config, "action_horizon",
-            config.action_head_cfg.get("action_horizon", getattr(config, "chunk_size", 16))
-        )
+        # Resolve action_horizon and action_dim.
+        # For N1.6 CraftNet: the GrootCoTConfig sets chunk_size=50 and max_action_dim=128,
+        # but the base GR00TN15Config may have action_horizon=16 and action_dim=32.
+        # Always prefer the action_head_cfg values which were set during __init__.
         _ah_version = getattr(config, "action_head_version", "n15")
         if _ah_version == "n16":
-            # N1.6 pads actions to max_action_dim (128); get from action_head_cfg.
-            self.action_dim = config.action_head_cfg.get(
-                "max_action_dim", getattr(config, "max_action_dim",
-                                          getattr(config, "action_dim", 128)))
+            self.action_horizon = config.action_head_cfg.get("action_horizon", 50)
+            self.action_dim = config.action_head_cfg.get("max_action_dim", 128)
         else:
+            self.action_horizon = config.action_head_cfg.get(
+                "action_horizon", getattr(config, "action_horizon", 16))
             self.action_dim = config.action_head_cfg.get(
                 "action_dim", getattr(config, "action_dim", 32))
         self.compute_dtype = config.compute_dtype
