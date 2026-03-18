@@ -144,6 +144,13 @@ class GrootCoTPolicy(PreTrainedPolicy):
             lower_body_joint_indices=self.config.lower_body_joint_indices,
             upper_body_loss_weight=self.config.upper_body_loss_weight,
             lower_body_loss_weight=self.config.lower_body_loss_weight,
+            # N1.6 action head
+            action_head_version=getattr(self.config, "action_head_version", "n15"),
+            n16_action_head_weights_path=getattr(self.config, "n16_action_head_weights_path", None),
+            # IK prior
+            ik_prior_prob=getattr(self.config, "ik_prior_prob", 0.0),
+            ik_prior_noise_scale=getattr(self.config, "ik_prior_noise_scale", 0.15),
+            ik_prior_arm_dim=getattr(self.config, "ik_prior_arm_dim", 14),
             # Optional RECAP/value extensions.
             value_head_enable=bool(getattr(self.config, "recap_value_head_enable", False)),
             tune_value_head=bool(getattr(self.config, "recap_tune_value_head", True)),

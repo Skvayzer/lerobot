@@ -1562,6 +1562,12 @@ class GR00TN15(PreTrainedModel):
         value_head_vmax = kwargs.pop("value_head_vmax", 0.0)
         value_head_pooling = kwargs.pop("value_head_pooling", "masked_mean")
         extra_observation_dims = kwargs.pop("extra_observation_dims", None)
+        # N1.6 action head
+        action_head_version = kwargs.pop("action_head_version", "n15")
+        n16_action_head_weights_path = kwargs.pop("n16_action_head_weights_path", None)
+        ik_prior_prob = kwargs.pop("ik_prior_prob", 0.0)
+        ik_prior_noise_scale = kwargs.pop("ik_prior_noise_scale", 0.15)
+        ik_prior_arm_dim = kwargs.pop("ik_prior_arm_dim", 14)
         primary_action_group_indices = kwargs.pop("primary_action_group_indices", None)
         secondary_action_group_indices = kwargs.pop("secondary_action_group_indices", None)
         primary_action_group_loss_weight = kwargs.pop("primary_action_group_loss_weight", None)
@@ -1654,6 +1660,12 @@ class GR00TN15(PreTrainedModel):
         config.action_head_lora_target_modules = action_head_lora_target_modules
         config.tune_top_llm_layers = tune_top_llm_layers
         config.tune_vlln = bool(tune_vlln)
+        # N1.6 action head config
+        config.action_head_version = action_head_version
+        config.n16_action_head_weights_path = n16_action_head_weights_path
+        config.ik_prior_prob = ik_prior_prob
+        config.ik_prior_noise_scale = ik_prior_noise_scale
+        config.ik_prior_arm_dim = ik_prior_arm_dim
         config.value_head_enable = bool(value_head_enable)
         config.tune_value_head = bool(tune_value_head)
         config.value_head_bins = int(value_head_bins)
