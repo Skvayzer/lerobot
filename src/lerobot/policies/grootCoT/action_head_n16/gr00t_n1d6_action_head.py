@@ -205,6 +205,9 @@ class Gr00tN1d6ActionHead(nn.Module):
 
         return x_0
 
+    def prepare_input(self, batch: dict) -> BatchFeature:
+        return BatchFeature(data=batch)
+
     def process_backbone_output(self, backbone_output: BatchFeature) -> BatchFeature:
         backbone_features = backbone_output["backbone_features"]
         backbone_features = self.vlln(backbone_features)
