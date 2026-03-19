@@ -1816,12 +1816,8 @@ class GR00TN15(PreTrainedModel):
                                     torch.nn.init.xavier_uniform_(_param.data)
                                 else:
                                     _param.data.zero_()
-                    _reloaded, _skipped = 0, 0
-                    del _qwen_cpu, _cpu_sd
-                    gc.collect()
-                    torch.cuda.empty_cache()
                     _new_max = _vit_proj.weight.float().abs().max().item()
-                    print(f"[GROOT] In-place reload done: {_reloaded} params reloaded, {_skipped} skipped. New ViT max={_new_max:.4g}", flush=True)
+                    print(f"[GROOT] Reinit done. New ViT max={_new_max:.4g}", flush=True)
             else:
                 print("[GROOT] WARNING: Could not locate ViT patch_embed.proj for weight check.", flush=True)
 
