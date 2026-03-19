@@ -1804,20 +1804,26 @@ class GR00TN15(PreTrainedModel):
                 print(f"[GROOT] ViT proj weight check: max={_w_max:.4g} (expected 0.001–1.0)", flush=True)
                 if _w_max > 10.0 or _w_max < 1e-6:
                     _reason = "zeroed out" if _w_max < 1e-6 else "uninitialized garbage"
-                    # Quick fix: reinit corrupted Qwen weights with proper random init.
-                    # The heavy CPU reload (loading full Qwen to CPU per rank) causes
-                    # OOM with 8 GPUs. Instead, just reinit -- pretrained_path checkpoint
-                    # will overwrite these weights anyway.
-                    print(f"[GROOT] Corrupted ViT weights detected ({_reason}, max={_w_max:.4g}). Reinitializing in-place...", flush=True)
+                    _backbone_cfg = getattr(pretrained_model.config, "backbone_cfg", {})
+                    _model_id = _backbone_cfg.get("model_id", "Qwen/Qwen3-VL-8B-Instruct")
+                    print(f"[GROOT] Corrupted ViT weights ({_reason}, max={_w_max:.4g}). Reloading from {_model_id}...", flush=True)
+                    import gc
+                    # Load full Qwen to CPU, copy weights, delete immediately.
+                    # ~16GB FP16 per rank -- fits if SLURM --mem >= 256G for 8 ranks.
+                    _fix_load_kw = {"trust_remote_code": True, "device_map": "cpu", "dtype": torch.float16}
+                    _reload_cls = Qwen3VLForConditionalGeneration if Qwen3VLForConditionalGeneration is not None else AutoModel
+                    _qwen_cpu = _reload_cls.from_pretrained(_model_id, **_fix_load_kw)
+                    _cpu_sd = _qwen_cpu.state_dict()
+                    _reloaded = 0
                     with torch.no_grad():
                         for _name, _param in _qwen_model.named_parameters():
-                            if torch.isnan(_param).any() or _param.float().abs().max().item() > 1e10:
-                                if _param.dim() >= 2:
-                                    torch.nn.init.xavier_uniform_(_param.data)
-                                else:
-                                    _param.data.zero_()
+                            if _name in _cpu_sd:
+                                _param.data.copy_(_cpu_sd[_name].to(dtype=_param.dtype, device=_param.device))
+                                _reloaded += 1
+                    del _qwen_cpu, _cpu_sd
+                    gc.collect()
                     _new_max = _vit_proj.weight.float().abs().max().item()
-                    print(f"[GROOT] Reinit done. New ViT max={_new_max:.4g}", flush=True)
+                    print(f"[GROOT] Reload done: {_reloaded} params. New ViT max={_new_max:.4g}", flush=True)
             else:
                 print("[GROOT] WARNING: Could not locate ViT patch_embed.proj for weight check.", flush=True)
 
