@@ -854,7 +854,14 @@ class GrootCoTPolicy(PreTrainedPolicy):
                         is_training=True,
                     )
                 else:
-                    outputs = self._groot_model.forward(groot_inputs)
+                    # Split backbone (partially frozen) from action head to save memory.
+                    # Frozen ViT + bottom LLM layers run under no_grad.
+                    backbone_outputs = self._groot_model.run_backbone(groot_inputs)
+                    outputs = self._groot_model.run_action_head(
+                        inputs=groot_inputs,
+                        backbone_outputs=backbone_outputs,
+                        is_training=True,
+                    )
 
         self._train_forward_step += 1
 
