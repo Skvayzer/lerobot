@@ -1810,15 +1810,23 @@ class GR00TN15(PreTrainedModel):
                     import gc
                     # Load full Qwen to CPU, copy weights, delete immediately.
                     # ~16GB FP16 per rank -- fits if SLURM --mem >= 256G for 8 ranks.
-                    _fix_load_kw = {"trust_remote_code": True, "device_map": "cpu", "dtype": torch.float16}
+                    _fix_load_kw = {"trust_remote_code": True, "device_map": "cpu", "dtype": torch.float32}
                     _reload_cls = Qwen3VLForConditionalGeneration if Qwen3VLForConditionalGeneration is not None else AutoModel
                     _qwen_cpu = _reload_cls.from_pretrained(_model_id, **_fix_load_kw)
                     _cpu_sd = _qwen_cpu.state_dict()
                     _reloaded = 0
                     with torch.no_grad():
                         for _name, _param in _qwen_model.named_parameters():
+                            # Try direct key match, then with/without "model." prefix
+                            _src = None
                             if _name in _cpu_sd:
-                                _param.data.copy_(_cpu_sd[_name].to(dtype=_param.dtype, device=_param.device))
+                                _src = _cpu_sd[_name]
+                            elif "model." + _name in _cpu_sd:
+                                _src = _cpu_sd["model." + _name]
+                            elif _name.startswith("model.") and _name[6:] in _cpu_sd:
+                                _src = _cpu_sd[_name[6:]]
+                            if _src is not None:
+                                _param.data.copy_(_src.to(dtype=_param.dtype, device=_param.device))
                                 _reloaded += 1
                     del _qwen_cpu, _cpu_sd
                     gc.collect()
