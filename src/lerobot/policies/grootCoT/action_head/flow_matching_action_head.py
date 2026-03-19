@@ -171,7 +171,7 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
 
     # IK prior source distribution settings
     ik_prior_prob: float = field(
-        default=0.4,
+        default=0.0,
         metadata={"help": "Probability of using IK-like linear prior instead of Gaussian noise for arm joints during training. 0.0 disables."}
     )
     ik_prior_noise_scale: float = field(

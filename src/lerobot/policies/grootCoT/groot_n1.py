@@ -1241,7 +1241,12 @@ class GR00TN15(PreTrainedModel):
                     print(f"[GROOT] Missing keys: {_missing[:5]}...")
             print(f"[GROOT] Using N1.6 action head (Gr00tN1d6ActionHead)")
         else:
-            action_head_cfg = FlowmatchingActionHeadConfig(**config.action_head_cfg)
+            # Propagate IK prior settings from top-level config into action_head_cfg
+            _n15_ah_cfg = dict(config.action_head_cfg)
+            _n15_ah_cfg["ik_prior_prob"] = getattr(config, "ik_prior_prob", 0.0)
+            _n15_ah_cfg["ik_prior_noise_scale"] = getattr(config, "ik_prior_noise_scale", 0.15)
+            _n15_ah_cfg["ik_prior_arm_dim"] = getattr(config, "ik_prior_arm_dim", 14)
+            action_head_cfg = FlowmatchingActionHeadConfig(**_n15_ah_cfg)
             # Propagate Action Head LoRA config
             ah_lora_cfg = getattr(config, "action_head_lora_config", {})
             if not ah_lora_cfg:
