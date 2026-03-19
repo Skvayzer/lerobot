@@ -175,15 +175,10 @@ class QwenBackbone(nn.Module):
         _is_rocm = getattr(torch.version, "hip", None) is not None
         print(f"[GROOT] ROCm check: load_bf16={load_bf16}, hip={getattr(torch.version, 'hip', None)}, _is_rocm={_is_rocm}", flush=True)
         if _is_rocm:
-            if not load_bf16:
-                # Use FP16 for frozen Qwen inference. FP16 works fine on MI210
-                # for inference (no NaN). Only BF16 matmuls produce NaN.
-                # This saves ~16GB vs FP32, making Stage 2 feasible.
-                self.qwen_model.half()
-                print(f"[GROOT] AMD ROCm: cast Qwen to FP16 (hip={torch.version.hip}). FP16 is safe for inference.", flush=True)
-            else:
-                self.qwen_model.float()
-                print(f"[GROOT] AMD ROCm: cast entire Qwen model to FP32 (hip={torch.version.hip}) to prevent BF16 NaN.", flush=True)
+            # MI210 (gfx90a) produces NaN with both BF16 and FP16 matmuls.
+            # Must use FP32 for all Qwen computations.
+            self.qwen_model.float()
+            print(f"[GROOT] AMD ROCm: cast entire Qwen model to FP32 (hip={torch.version.hip}) to prevent NaN.", flush=True)
         # Diagnostic hook: print ViT output stats for first 3 forward passes
         _hook_calls = [0]
         def _vit_diag_hook(module, inp, out):
