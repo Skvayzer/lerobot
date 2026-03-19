@@ -838,36 +838,27 @@ class GrootCoTPolicy(PreTrainedPolicy):
                     fresh_visual_features=fresh_visual,
                 )
             else:
-                _projector_only = getattr(self.config, "train_vlm_projector_only", False)
-                if _projector_only:
-                    # Stage 1: Qwen is fully frozen. Run under no_grad to skip
-                    # activation storage for 36 LLM layers (~15-20GB saved).
-                    with torch.no_grad():
-                        backbone_outputs = self._groot_model.run_backbone(groot_inputs)
-                    # Detach backbone features so gradients don't flow into Qwen.
-                    for k in list(backbone_outputs.keys()):
-                        if isinstance(backbone_outputs[k], torch.Tensor) and backbone_outputs[k].requires_grad:
-                            backbone_outputs[k] = backbone_outputs[k].detach().requires_grad_(True)
-                    outputs = self._groot_model.run_action_head(
-                        inputs=groot_inputs,
-                        backbone_outputs=backbone_outputs,
-                        is_training=True,
-                    )
-                else:
-                    # Run backbone under no_grad -- ViT and LLM are frozen or
-                    # nearly frozen, and projector gradients come from the action
-                    # head's cross-attention backward. Detach output so gradient
-                    # flows through projector → action head only.
-                    with torch.no_grad():
-                        backbone_outputs = self._groot_model.run_backbone(groot_inputs)
-                    for k in list(backbone_outputs.keys()):
-                        if isinstance(backbone_outputs[k], torch.Tensor) and backbone_outputs[k].requires_grad:
-                            backbone_outputs[k] = backbone_outputs[k].detach().requires_grad_(True)
-                    outputs = self._groot_model.run_action_head(
-                        inputs=groot_inputs,
-                        backbone_outputs=backbone_outputs,
-                        is_training=True,
-                    )
+                # Run backbone under no_grad to skip storing activation tensors
+                # for 36 frozen Qwen layers (~15-20GB saved). Detach output so
+                # gradients flow through projector → action head only.
+                with torch.no_grad():
+                    backbone_outputs = self._groot_model.run_backbone(groot_inputs)
+                for k in list(backbone_outputs.keys()):
+                    if isinstance(backbone_outputs[k], torch.Tensor) and backbone_outputs[k].requires_grad:
+                        backbone_outputs[k] = backbone_outputs[k].detach().requires_grad_(True)
+                # Enable gradient checkpointing on DiT to trade compute for memory.
+                # Saves ~10GB by not storing intermediate activations for 32 DiT layers.
+                if not getattr(self, "_dit_gc_enabled", False):
+                    ah = self._groot_model.action_head
+                    if hasattr(ah, "model") and hasattr(ah.model, "gradient_checkpointing"):
+                        ah.model.gradient_checkpointing = True
+                        print("[GROOT] Enabled gradient checkpointing on DiT")
+                    self._dit_gc_enabled = True
+                outputs = self._groot_model.run_action_head(
+                    inputs=groot_inputs,
+                    backbone_outputs=backbone_outputs,
+                    is_training=True,
+                )
 
         self._train_forward_step += 1
 
