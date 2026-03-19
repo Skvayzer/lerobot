@@ -102,17 +102,39 @@ class GrootCoTConfig(PreTrainedConfig):
     dex3_canonical_camera_order: list[str] = field(
         default_factory=lambda: [
             "observation.images.cam_left_high",
-            "observation.images.depth_cam_left_high",
             "observation.images.cam_left_wrist",
-            "observation.images.depth_cam_left_wrist",
             "observation.images.cam_right_wrist",
-            "observation.images.depth_cam_right_wrist",
         ]
     )
     # Missing-view policy for canonical Dex3 camera packing.
     # - "zero_fill": substitute missing camera with a zero image tensor.
     # - "error": fail fast if any canonical camera is missing.
     dex3_missing_camera_policy: str = "zero_fill"
+
+    # --- iDP3-style depth encoder ---------------------------------------------------
+    # When enabled, raw depth PNGs are loaded by the preprocessor, back-projected to
+    # point clouds, and encoded by a lightweight PointNet into a fixed-length vector
+    # injected as "observation.extra.depth_encoded" into the action head.
+    depth_encoder_enable: bool = False
+    depth_encoder_num_views: int = 2
+    depth_encoder_num_points: int = 512
+    depth_encoder_out_dim: int = 64
+    depth_encoder_img_height: int = 224
+    depth_encoder_img_width: int = 224
+    depth_encoder_fx: float = 200.0
+    depth_encoder_fy: float = 200.0
+    depth_encoder_cx: float = 112.0
+    depth_encoder_cy: float = 112.0
+    depth_encoder_depth_max: float = 3.0
+    # Camera keys whose depth PNGs are loaded from disk (must match num_views)
+    depth_camera_keys: list[str] = field(
+        default_factory=lambda: [
+            "observation.images.depth_cam_left_wrist",
+            "observation.images.depth_cam_right_wrist",
+        ]
+    )
+    # Sub-directory under the dataset root that holds raw depth PNGs
+    depth_raw_subdir: str = "depth_raw"
 
     # Optional action-group split for weighted action loss.
     # If only primary indices are provided, secondary is treated as complement.

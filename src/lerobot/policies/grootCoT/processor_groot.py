@@ -15,9 +15,11 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
+from pathlib import Path
 import re
 from typing import TYPE_CHECKING, Any
 
+import cv2
 import numpy as np
 import torch
 from einops import rearrange
@@ -205,6 +207,9 @@ def make_groot_pre_post_processors(
             dex3_missing_camera_policy=getattr(config, "dex3_missing_camera_policy", "zero_fill"),
             use_grounded_reference_frame=getattr(config, "use_grounded_reference_frame", False),
             use_relative_actions=getattr(config, "use_relative_actions", False),
+            depth_camera_keys=list(getattr(config, "depth_camera_keys", [])),
+            depth_raw_subdir=str(getattr(config, "depth_raw_subdir", "depth_raw")),
+            _dataset_root=getattr(config, "_dataset_root", None),
         ),
         # 4. Qwen encode (creates qwen_content)
         GrootQwenEncodeStep(
@@ -372,6 +377,10 @@ class GrootPackInputsStep(ProcessorStep):
     use_grounded_reference_frame: bool = False
     # Relative actions: subtract current state from action before normalization
     use_relative_actions: bool = False
+    # Depth encoder: camera keys and raw-PNG directory
+    depth_camera_keys: list[str] = field(default_factory=list)
+    depth_raw_subdir: str = "depth_raw"
+    _dataset_root: str | None = None
 
     def _resolve_dex3_camera_key(self, obs: dict[str, Any], canonical_key: str) -> str | None:
         candidates = [canonical_key, *(self.dex3_camera_aliases.get(canonical_key, []))]
@@ -502,6 +511,57 @@ class GrootPackInputsStep(ProcessorStep):
             for k in available_img_keys:
                 obs.pop(k, None)
             obs.pop("observation.image", None)
+
+        # 1b) Depth PNG loading for iDP3 depth encoder
+        # Reads 16-bit depth PNGs from depth_raw/ directory and stores them
+        # as a float32 tensor under "observation.depth_images" (B, V, H, W) in metres.
+        if self.depth_camera_keys and self._dataset_root is not None:
+            dataset_root = Path(self._dataset_root)
+            depth_views: list[torch.Tensor] = []
+            # Determine batch size from video or first available tensor
+            _bsz = 1
+            if "video" in obs:
+                _bsz = obs["video"].shape[0]
+            else:
+                for _v in obs.values():
+                    if isinstance(_v, (torch.Tensor, np.ndarray)) and hasattr(_v, "shape"):
+                        _bsz = _v.shape[0] if len(_v.shape) > 0 else 1
+                        break
+
+            # comp carries the frame index used by the dataset sampler
+            frame_index = comp.get("frame_index", comp.get("index", 0))
+            if isinstance(frame_index, torch.Tensor):
+                frame_index = frame_index.item()
+            episode_index = comp.get("episode_index", 0)
+            if isinstance(episode_index, torch.Tensor):
+                episode_index = episode_index.item()
+
+            for cam_key in self.depth_camera_keys:
+                # Derive PNG path: <root>/depth_raw/<cam_short>/<episode>_<frame>.png
+                cam_short = cam_key.replace("observation.images.", "")
+                png_path = (
+                    dataset_root
+                    / self.depth_raw_subdir
+                    / cam_short
+                    / f"{int(episode_index):06d}_{int(frame_index):06d}.png"
+                )
+                if png_path.exists():
+                    raw = cv2.imread(str(png_path), cv2.IMREAD_UNCHANGED)
+                    if raw is None:
+                        depth_m = np.zeros((224, 224), dtype=np.float32)
+                    else:
+                        # 16-bit PNG depth in millimetres → metres
+                        depth_m = raw.astype(np.float32) / 1000.0
+                        if depth_m.ndim == 3:
+                            depth_m = depth_m[:, :, 0]
+                else:
+                    depth_m = np.zeros((224, 224), dtype=np.float32)
+
+                depth_tensor = torch.from_numpy(depth_m).unsqueeze(0).expand(_bsz, -1, -1)
+                depth_views.append(depth_tensor)
+
+            if depth_views:
+                obs["observation.depth_images"] = torch.stack(depth_views, dim=1)  # (B, V, H, W)
 
         # 2) Language (string)
         lang = comp.get(self.language_key)

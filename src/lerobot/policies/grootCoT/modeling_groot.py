@@ -164,6 +164,33 @@ class GrootCoTPolicy(PreTrainedPolicy):
         model.compute_dtype = "bfloat16" if self.config.use_bf16 else model.compute_dtype
         model.config.compute_dtype = model.compute_dtype
 
+        # --- iDP3 depth encoder (optional) ---
+        if getattr(self.config, "depth_encoder_enable", False):
+            from lerobot.policies.grootCoT.depth_encoder import (
+                DepthEncoderConfig,
+                PointCloudDepthEncoder,
+            )
+
+            depth_cfg = DepthEncoderConfig(
+                num_views=int(getattr(self.config, "depth_encoder_num_views", 2)),
+                num_points=int(getattr(self.config, "depth_encoder_num_points", 512)),
+                out_dim=int(getattr(self.config, "depth_encoder_out_dim", 64)),
+                img_height=int(getattr(self.config, "depth_encoder_img_height", 224)),
+                img_width=int(getattr(self.config, "depth_encoder_img_width", 224)),
+                fx=float(getattr(self.config, "depth_encoder_fx", 200.0)),
+                fy=float(getattr(self.config, "depth_encoder_fy", 200.0)),
+                cx=float(getattr(self.config, "depth_encoder_cx", 112.0)),
+                cy=float(getattr(self.config, "depth_encoder_cy", 112.0)),
+                depth_max=float(getattr(self.config, "depth_encoder_depth_max", 3.0)),
+            )
+            self._depth_encoder = PointCloudDepthEncoder(depth_cfg)
+            print(
+                f"[GROOT] Depth encoder enabled: {depth_cfg.num_views} views, "
+                f"{depth_cfg.num_points} pts, out_dim={depth_cfg.out_dim}"
+            )
+        else:
+            self._depth_encoder = None
+
         return model
 
     def _get_extra_observation_dims(self) -> dict[str, int]:
@@ -185,9 +212,40 @@ class GrootCoTPolicy(PreTrainedPolicy):
             indicator_key = getattr(self.config, "recap_adv_indicator_key", "observation.extra.adv_indicator")
             extra_dims.setdefault(indicator_key, 1)
 
+        # iDP3 depth encoder output
+        if getattr(self.config, "depth_encoder_enable", False):
+            depth_total_dim = (
+                int(getattr(self.config, "depth_encoder_num_views", 2))
+                * int(getattr(self.config, "depth_encoder_out_dim", 64))
+            )
+            extra_dims["observation.extra.depth_encoded"] = depth_total_dim
+
         if extra_dims:
             print(f"[GROOT] Extra observation projections enabled for keys: {sorted(extra_dims.keys())}")
         return extra_dims
+
+    def _encode_depth_features(self, groot_inputs: dict[str, Tensor]) -> dict[str, Tensor]:
+        """Run iDP3 depth encoder and inject output as an extra observation.
+
+        If the depth encoder is disabled or no depth images are present, the
+        inputs dict is returned unchanged.
+        """
+        if self._depth_encoder is None:
+            return groot_inputs
+        depth = groot_inputs.get("observation.depth_images")
+        if depth is None:
+            return groot_inputs
+
+        # Ensure depth tensor is on the same device / dtype as the encoder
+        enc_device = next(self._depth_encoder.parameters()).device
+        depth = depth.to(device=enc_device, dtype=torch.float32)
+
+        # depth: (B, V, H, W) → encoded: (B, V*out_dim)
+        encoded = self._depth_encoder(depth)
+        groot_inputs["observation.extra.depth_encoded"] = encoded
+        # Remove raw depth so downstream GR00T doesn't choke on it
+        groot_inputs.pop("observation.depth_images", None)
+        return groot_inputs
 
     def reset(self):
         """Reset policy state when environment resets."""
@@ -251,6 +309,7 @@ class GrootCoTPolicy(PreTrainedPolicy):
                 or k.startswith("qwen_")
                 or k.startswith("eagle_")  # backward compatibility for older checkpoints
                 or k.startswith("observation.extra.")
+                or k == "observation.depth_images"
             )
             and not (k.startswith("next.") or k == "info")
         }
@@ -680,6 +739,7 @@ class GrootCoTPolicy(PreTrainedPolicy):
         force_backbone_refresh: bool,
         use_cached_dual_rate: bool = True,
     ) -> Tensor:
+        groot_inputs = self._encode_depth_features(groot_inputs)
         device = next(self.parameters()).device
         use_cfg = (
             bool(getattr(self.config, "recap_enable", False))
@@ -810,6 +870,7 @@ class GrootCoTPolicy(PreTrainedPolicy):
 
         # Build a clean input dict for GR00T: keep only tensors GR00T consumes
         groot_inputs = self._build_groot_inputs(batch, include_action=True)
+        groot_inputs = self._encode_depth_features(groot_inputs)
 
         # Get device from model parameters
         device = next(self.parameters()).device
@@ -977,6 +1038,7 @@ class GrootCoTPolicy(PreTrainedPolicy):
             # System 1 fast-visual path: generate actions using cached System 2
             # backbone features + fresh ViT features from the current camera frame.
             # This fills the gap between System 2 updates with reactive actions.
+            groot_inputs = self._encode_depth_features(groot_inputs)
             device = next(self.parameters()).device
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=self.config.use_bf16):
                 fresh_visual = self._get_fresh_visual_features(groot_inputs)
