@@ -1803,30 +1803,20 @@ class GR00TN15(PreTrainedModel):
                 _w_max = _vit_proj.weight.float().abs().max().item()
                 print(f"[GROOT] ViT proj weight check: max={_w_max:.4g} (expected 0.001–1.0)", flush=True)
                 if _w_max > 10.0 or _w_max < 1e-6:
-                    # Weights are uninitialized garbage — reload in-place from Qwen checkpoint
-                    _backbone_cfg = getattr(pretrained_model.config, "backbone_cfg", {})
-                    _model_id = _backbone_cfg.get("model_id", "Qwen/Qwen3-VL-8B-Instruct")
                     _reason = "zeroed out" if _w_max < 1e-6 else "uninitialized garbage"
-                    print(f"[GROOT] Corrupted ViT weights detected ({_reason}, max={_w_max:.4g}). In-place reload from {_model_id}...", flush=True)
-                    import gc
-                    _is_rocm_fix = getattr(torch.version, "hip", None) is not None
-                    _fix_load_kw = {
-                        "trust_remote_code": True,
-                        "device_map": "cpu",
-                        "dtype": torch.float32,
-                    }
-                    _reload_cls = Qwen3VLForConditionalGeneration if Qwen3VLForConditionalGeneration is not None else AutoModel
-                    _qwen_cpu = _reload_cls.from_pretrained(_model_id, **_fix_load_kw)
-                    _cpu_sd = _qwen_cpu.state_dict()
-                    _reloaded, _skipped = 0, 0
+                    # Quick fix: reinit corrupted Qwen weights with proper random init.
+                    # The heavy CPU reload (loading full Qwen to CPU per rank) causes
+                    # OOM with 8 GPUs. Instead, just reinit -- pretrained_path checkpoint
+                    # will overwrite these weights anyway.
+                    print(f"[GROOT] Corrupted ViT weights detected ({_reason}, max={_w_max:.4g}). Reinitializing in-place...", flush=True)
                     with torch.no_grad():
                         for _name, _param in _qwen_model.named_parameters():
-                            if _name in _cpu_sd:
-                                _src = _cpu_sd[_name].to(dtype=_param.dtype, device=_param.device)
-                                _param.data.copy_(_src)
-                                _reloaded += 1
-                            else:
-                                _skipped += 1
+                            if torch.isnan(_param).any() or _param.float().abs().max().item() > 1e10:
+                                if _param.dim() >= 2:
+                                    torch.nn.init.xavier_uniform_(_param.data)
+                                else:
+                                    _param.data.zero_()
+                    _reloaded, _skipped = 0, 0
                     del _qwen_cpu, _cpu_sd
                     gc.collect()
                     torch.cuda.empty_cache()
