@@ -854,9 +854,15 @@ class GrootCoTPolicy(PreTrainedPolicy):
                         is_training=True,
                     )
                 else:
-                    # Split backbone (partially frozen) from action head to save memory.
-                    # Frozen ViT + bottom LLM layers run under no_grad.
-                    backbone_outputs = self._groot_model.run_backbone(groot_inputs)
+                    # Run backbone under no_grad -- ViT and LLM are frozen or
+                    # nearly frozen, and projector gradients come from the action
+                    # head's cross-attention backward. Detach output so gradient
+                    # flows through projector → action head only.
+                    with torch.no_grad():
+                        backbone_outputs = self._groot_model.run_backbone(groot_inputs)
+                    for k in list(backbone_outputs.keys()):
+                        if isinstance(backbone_outputs[k], torch.Tensor) and backbone_outputs[k].requires_grad:
+                            backbone_outputs[k] = backbone_outputs[k].detach().requires_grad_(True)
                     outputs = self._groot_model.run_action_head(
                         inputs=groot_inputs,
                         backbone_outputs=backbone_outputs,
