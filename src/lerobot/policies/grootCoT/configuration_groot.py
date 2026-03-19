@@ -102,11 +102,8 @@ class GrootCoTConfig(PreTrainedConfig):
     dex3_canonical_camera_order: list[str] = field(
         default_factory=lambda: [
             "observation.images.cam_left_high",
-            "observation.images.depth_cam_left_high",
             "observation.images.cam_left_wrist",
-            "observation.images.depth_cam_left_wrist",
             "observation.images.cam_right_wrist",
-            "observation.images.depth_cam_right_wrist",
         ]
     )
     # Missing-view policy for canonical Dex3 camera packing.
