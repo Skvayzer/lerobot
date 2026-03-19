@@ -248,21 +248,26 @@ class DiT(ModelMixin, ConfigMixin):
 
         for idx, block in enumerate(self.transformer_blocks):
             if idx % 2 == 1 and self.config.interleave_self_attention:
-                hidden_states = block(
-                    hidden_states,
+                block_kwargs = dict(
                     attention_mask=None,
                     encoder_hidden_states=None,
                     encoder_attention_mask=None,
                     temb=temb,
                 )
             else:
-                hidden_states = block(
-                    hidden_states,
+                block_kwargs = dict(
                     attention_mask=None,
                     encoder_hidden_states=encoder_hidden_states,
                     encoder_attention_mask=None,
                     temb=temb,
                 )
+
+            if self.gradient_checkpointing and self.training:
+                hidden_states = torch.utils.checkpoint.checkpoint(
+                    block, hidden_states, use_reentrant=False, **block_kwargs,
+                )
+            else:
+                hidden_states = block(hidden_states, **block_kwargs)
             all_hidden_states.append(hidden_states)
 
         conditioning = temb
@@ -310,8 +315,7 @@ class AlternateVLDiT(DiT):
 
         for idx, block in enumerate(self.transformer_blocks):
             if idx % 2 == 1:
-                hidden_states = block(
-                    hidden_states,
+                block_kwargs = dict(
                     attention_mask=None,
                     encoder_hidden_states=None,
                     encoder_attention_mask=None,
@@ -322,14 +326,19 @@ class AlternateVLDiT(DiT):
                     curr_encoder_attention_mask = non_image_attention_mask
                 else:
                     curr_encoder_attention_mask = image_attention_mask
-
-                hidden_states = block(
-                    hidden_states,
+                block_kwargs = dict(
                     attention_mask=None,
                     encoder_hidden_states=encoder_hidden_states,
                     encoder_attention_mask=curr_encoder_attention_mask,
                     temb=temb,
                 )
+
+            if self.gradient_checkpointing and self.training:
+                hidden_states = torch.utils.checkpoint.checkpoint(
+                    block, hidden_states, use_reentrant=False, **block_kwargs,
+                )
+            else:
+                hidden_states = block(hidden_states, **block_kwargs)
             all_hidden_states.append(hidden_states)
 
         conditioning = temb
