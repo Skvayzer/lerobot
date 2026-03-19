@@ -172,21 +172,22 @@ class GrootCoTPolicy(PreTrainedPolicy):
             )
 
             depth_cfg = DepthEncoderConfig(
-                num_views=int(getattr(self.config, "depth_encoder_num_views", 2)),
-                num_points=int(getattr(self.config, "depth_encoder_num_points", 512)),
-                out_dim=int(getattr(self.config, "depth_encoder_out_dim", 64)),
-                img_height=int(getattr(self.config, "depth_encoder_img_height", 224)),
-                img_width=int(getattr(self.config, "depth_encoder_img_width", 224)),
-                fx=float(getattr(self.config, "depth_encoder_fx", 200.0)),
-                fy=float(getattr(self.config, "depth_encoder_fy", 200.0)),
-                cx=float(getattr(self.config, "depth_encoder_cx", 112.0)),
-                cy=float(getattr(self.config, "depth_encoder_cy", 112.0)),
-                depth_max=float(getattr(self.config, "depth_encoder_depth_max", 3.0)),
+                num_views=int(getattr(self.config, "depth_encoder_num_views", 3)),
+                num_points_per_view=int(getattr(self.config, "depth_encoder_num_points", 512)),
+                conv_channels=list(getattr(self.config, "depth_encoder_conv_channels", [64, 128, 256])),
+                output_dim=int(getattr(self.config, "depth_encoder_output_dim", 256)),
+                input_height=int(getattr(self.config, "depth_encoder_input_height", 480)),
+                input_width=int(getattr(self.config, "depth_encoder_input_width", 640)),
+                default_fx=float(getattr(self.config, "depth_encoder_fx", 430.0)),
+                default_fy=float(getattr(self.config, "depth_encoder_fy", 430.0)),
+                default_cx=float(getattr(self.config, "depth_encoder_cx", 320.0)),
+                default_cy=float(getattr(self.config, "depth_encoder_cy", 240.0)),
             )
             self._depth_encoder = PointCloudDepthEncoder(depth_cfg)
+            pc = sum(p.numel() for p in self._depth_encoder.parameters())
             print(
-                f"[GROOT] Depth encoder enabled: {depth_cfg.num_views} views, "
-                f"{depth_cfg.num_points} pts, out_dim={depth_cfg.out_dim}"
+                f"[GROOT] iDP3 depth encoder: {pc/1e6:.2f}M params, "
+                f"output_dim={depth_cfg.output_dim}, always trainable"
             )
         else:
             self._depth_encoder = None
@@ -212,13 +213,11 @@ class GrootCoTPolicy(PreTrainedPolicy):
             indicator_key = getattr(self.config, "recap_adv_indicator_key", "observation.extra.adv_indicator")
             extra_dims.setdefault(indicator_key, 1)
 
-        # iDP3 depth encoder output
+        # iDP3 depth encoder output (single vector, not per-view)
         if getattr(self.config, "depth_encoder_enable", False):
-            depth_total_dim = (
-                int(getattr(self.config, "depth_encoder_num_views", 2))
-                * int(getattr(self.config, "depth_encoder_out_dim", 64))
+            extra_dims["observation.extra.depth_encoded"] = int(
+                getattr(self.config, "depth_encoder_output_dim", 256)
             )
-            extra_dims["observation.extra.depth_encoded"] = depth_total_dim
 
         if extra_dims:
             print(f"[GROOT] Extra observation projections enabled for keys: {sorted(extra_dims.keys())}")

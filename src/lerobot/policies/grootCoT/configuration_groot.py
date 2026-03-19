@@ -111,29 +111,28 @@ class GrootCoTConfig(PreTrainedConfig):
     # - "error": fail fast if any canonical camera is missing.
     dex3_missing_camera_policy: str = "zero_fill"
 
-    # --- iDP3-style depth encoder ---------------------------------------------------
-    # When enabled, raw depth PNGs are loaded by the preprocessor, back-projected to
-    # point clouds, and encoded by a lightweight PointNet into a fixed-length vector
-    # injected as "observation.extra.depth_encoded" into the action head.
-    depth_encoder_enable: bool = False
-    depth_encoder_num_views: int = 2
+    # ── iDP3 Depth Encoder ──
+    # Depth bypasses Qwen VLM entirely. Encoded by lightweight point cloud
+    # encoder, output conditions DiT via extra_observation_projectors.
+    depth_encoder_enable: bool = True
+    depth_encoder_num_views: int = 3
     depth_encoder_num_points: int = 512
-    depth_encoder_out_dim: int = 64
-    depth_encoder_img_height: int = 224
-    depth_encoder_img_width: int = 224
-    depth_encoder_fx: float = 200.0
-    depth_encoder_fy: float = 200.0
-    depth_encoder_cx: float = 112.0
-    depth_encoder_cy: float = 112.0
-    depth_encoder_depth_max: float = 3.0
-    # Camera keys whose depth PNGs are loaded from disk (must match num_views)
+    depth_encoder_conv_channels: list[int] = field(default_factory=lambda: [64, 128, 256])
+    depth_encoder_output_dim: int = 256
+    depth_encoder_input_height: int = 480
+    depth_encoder_input_width: int = 640
+    depth_encoder_fx: float = 430.0
+    depth_encoder_fy: float = 430.0
+    depth_encoder_cx: float = 320.0
+    depth_encoder_cy: float = 240.0
     depth_camera_keys: list[str] = field(
         default_factory=lambda: [
-            "observation.images.depth_cam_left_wrist",
-            "observation.images.depth_cam_right_wrist",
+            "observation.images.cam_left_high",
+            "observation.images.cam_left_wrist",
+            "observation.images.cam_right_wrist",
         ]
     )
-    # Sub-directory under the dataset root that holds raw depth PNGs
+    # Path to depth_raw/ directory (relative to dataset root)
     depth_raw_subdir: str = "depth_raw"
 
     # Optional action-group split for weighted action loss.
