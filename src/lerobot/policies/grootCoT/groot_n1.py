@@ -1241,6 +1241,12 @@ class GR00TN15(PreTrainedModel):
             _n15_ah_cfg["ik_prior_prob"] = getattr(config, "ik_prior_prob", 0.0)
             _n15_ah_cfg["ik_prior_noise_scale"] = getattr(config, "ik_prior_noise_scale", 0.15)
             _n15_ah_cfg["ik_prior_arm_dim"] = getattr(config, "ik_prior_arm_dim", 14)
+            # Physical intent + RECAP
+            _n15_ah_cfg["physical_intent_enable"] = getattr(config, "physical_intent_enable", False)
+            _n15_ah_cfg["physical_intent_dim"] = getattr(config, "physical_intent_dim", 128)
+            _n15_ah_cfg["recap_enable"] = getattr(config, "recap_enable", False)
+            _n15_ah_cfg["recap_alpha"] = getattr(config, "recap_alpha", 1.0)
+            _n15_ah_cfg["recap_i_dropout"] = getattr(config, "recap_i_dropout", 0.1)
             action_head_cfg = FlowmatchingActionHeadConfig(**_n15_ah_cfg)
             # Propagate Action Head LoRA config
             ah_lora_cfg = getattr(config, "action_head_lora_config", {})

@@ -183,6 +183,15 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
         metadata={"help": "Number of leading action dimensions treated as arm joints for IK prior. Dex3 G1 = 14 (7 left + 7 right arm)."}
     )
 
+    # Physical intent (System 1 → System 0)
+    physical_intent_enable: bool = field(default=False)
+    physical_intent_dim: int = field(default=128)
+
+    # RECAP (Stage 4+)
+    recap_enable: bool = field(default=False)
+    recap_alpha: float = field(default=1.0)
+    recap_i_dropout: float = field(default=0.1)
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         for key, value in kwargs.items():
@@ -251,6 +260,25 @@ class FlowmatchingActionHead(nn.Module):
                 "[FlowmatchingActionHead] Extra observation projectors initialized for keys: "
                 f"{sorted(self.extra_observation_dims.keys())}"
             )
+
+        # Physical intent projector (System 1 → System 0)
+        self._physical_intent_enable = bool(getattr(config, "physical_intent_enable", False))
+        self._physical_intent_dim = int(getattr(config, "physical_intent_dim", 128))
+        self._last_physical_intent = None
+        if self._physical_intent_enable:
+            self.intent_projector = nn.Linear(self.input_embedding_dim, self._physical_intent_dim)
+            print(f"[FlowmatchingActionHead] Physical intent projector: "
+                  f"{self.input_embedding_dim} -> {self._physical_intent_dim}")
+
+        # RECAP improvement indicator embedding (Stage 4+)
+        self._recap_enable = bool(getattr(config, "recap_enable", False))
+        self._recap_alpha = float(getattr(config, "recap_alpha", 1.0))
+        self._recap_i_dropout = float(getattr(config, "recap_i_dropout", 0.1))
+        if self._recap_enable:
+            self.improvement_embed = nn.Embedding(2, self.input_embedding_dim)
+            nn.init.normal_(self.improvement_embed.weight, std=0.02)
+            print(f"[FlowmatchingActionHead] RECAP enabled: alpha={self._recap_alpha}, "
+                  f"dropout={self._recap_i_dropout}")
 
         self.future_tokens = nn.Embedding(config.num_target_vision_tokens, self.input_embedding_dim)
         nn.init.normal_(self.future_tokens.weight, mean=0.0, std=0.02)
@@ -663,15 +691,45 @@ class FlowmatchingActionHead(nn.Module):
         future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
         sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
 
+        # RECAP: prepend improvement indicator if enabled
+        improvement_indicator = action_input.get("observation.extra.adv_indicator", None)
+        recap_token_prepended = False
+        if self._recap_enable and improvement_indicator is not None:
+            I_val = improvement_indicator.long().clamp(0, 1).to(device)
+            if not (self.training and torch.rand(1).item() < self._recap_i_dropout):
+                I_embed = self.improvement_embed(I_val).unsqueeze(1)  # (B, 1, 1536)
+                sa_embs = torch.cat([I_embed, sa_embs], dim=1)  # prepend
+                recap_token_prepended = True
+
         vl_attn_mask = backbone_output.backbone_attention_mask
 
-        model_output = self.model(
-            hidden_states=sa_embs,
-            encoder_hidden_states=vl_embs,
-            encoder_attention_mask=vl_attn_mask,
-            timestep=t_discretized,
-            return_all_hidden_states=False,  # NOTE (YL): not using flare now
-        )
+        # Run DiT forward, optionally capturing penultimate layer for physical intent
+        if self._physical_intent_enable:
+            model_output, penultimate = self.model(
+                hidden_states=sa_embs,
+                encoder_hidden_states=vl_embs,
+                encoder_attention_mask=vl_attn_mask,
+                timestep=t_discretized,
+                return_all_hidden_states=False,
+                return_penultimate=True,
+            )
+            # Extract intent from action tokens of penultimate layer
+            action_tokens = penultimate[:, -actions.shape[1]:, :]  # (B, 16, 1536)
+            physical_intent = self.intent_projector(action_tokens.mean(dim=1))  # (B, 128)
+            self._last_physical_intent = physical_intent.detach()
+        else:
+            model_output = self.model(
+                hidden_states=sa_embs,
+                encoder_hidden_states=vl_embs,
+                encoder_attention_mask=vl_attn_mask,
+                timestep=t_discretized,
+                return_all_hidden_states=False,
+            )
+
+        # Strip RECAP token before decoding
+        if recap_token_prepended:
+            model_output = model_output[:, 1:, :]
+
         pred = self.action_decoder(model_output, embodiment_id)
         pred_actions = pred[:, -actions.shape[1] :]
 
@@ -802,19 +860,47 @@ class FlowmatchingActionHead(nn.Module):
             future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
             sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
 
-            # Run model forward.
-            model_output = self.model(
-                hidden_states=sa_embs,
-                encoder_hidden_states=vl_embs,
-                timestep=timesteps_tensor,
-            )
+            # RECAP: prepend I=1 at inference (always select success distribution)
+            if self._recap_enable:
+                I_val = torch.ones(batch_size, dtype=torch.long, device=device)
+                I_embed = self.improvement_embed(I_val).unsqueeze(1)
+                sa_embs = torch.cat([I_embed, sa_embs], dim=1)
+
+            # Run model forward, capture penultimate on last denoising step
+            capture_intent = self._physical_intent_enable and (t == num_steps - 1)
+            if capture_intent:
+                model_output, penultimate = self.model(
+                    hidden_states=sa_embs,
+                    encoder_hidden_states=vl_embs,
+                    timestep=timesteps_tensor,
+                    return_penultimate=True,
+                )
+                action_tokens = penultimate[:, -self.action_horizon:, :]
+                self._last_physical_intent = self.intent_projector(
+                    action_tokens.mean(dim=1)
+                ).detach()
+            else:
+                model_output = self.model(
+                    hidden_states=sa_embs,
+                    encoder_hidden_states=vl_embs,
+                    timestep=timesteps_tensor,
+                )
+
+            # Strip RECAP token
+            if self._recap_enable:
+                model_output = model_output[:, 1:, :]
+
             pred = self.action_decoder(model_output, embodiment_id)
 
             pred_velocity = pred[:, -self.action_horizon :]
 
             # Update actions using euler integration.
             actions = actions + dt * pred_velocity
-        return BatchFeature(data={"action_pred": actions})
+
+        result = {"action_pred": actions}
+        if self._last_physical_intent is not None:
+            result["physical_intent"] = self._last_physical_intent
+        return BatchFeature(data=result)
 
     @property
     def device(self):

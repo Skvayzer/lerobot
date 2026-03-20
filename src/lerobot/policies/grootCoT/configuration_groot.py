@@ -135,6 +135,19 @@ class GrootCoTConfig(PreTrainedConfig):
     # Path to depth_raw/ directory (relative to dataset root)
     depth_raw_subdir: str = "depth_raw"
 
+    # ── Physical Intent (System 1 → System 0) ──
+    # Extract a compact intent vector from DiT penultimate layer.
+    # Sent to System 0 MoE policy to condition expert routing.
+    physical_intent_enable: bool = False
+    physical_intent_dim: int = 128
+    physical_intent_layer: int = 14  # penultimate of 16-layer DiT
+
+    # ── RECAP (Stage 4+) ──
+    # Improvement indicator embedding for reward-conditioned training.
+    recap_enable: bool = False
+    recap_alpha: float = 1.0
+    recap_i_dropout: float = 0.1
+
     # Optional action-group split for weighted action loss.
     # If only primary indices are provided, secondary is treated as complement.
     # If only secondary indices are provided, primary is treated as complement.

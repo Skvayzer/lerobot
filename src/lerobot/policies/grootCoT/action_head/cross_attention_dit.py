@@ -261,6 +261,7 @@ class DiT(ModelMixin, ConfigMixin):
         timestep: torch.LongTensor | None = None,
         encoder_attention_mask: torch.Tensor | None = None,
         return_all_hidden_states: bool = False,
+        return_penultimate: bool = False,
     ):
         # Encode timesteps
         temb = self.timestep_encoder(timestep)
@@ -270,6 +271,7 @@ class DiT(ModelMixin, ConfigMixin):
         encoder_hidden_states = encoder_hidden_states.contiguous()
 
         all_hidden_states = [hidden_states]
+        penultimate_hidden = None
 
         # Process through transformer blocks
         for idx, block in enumerate(self.transformer_blocks):
@@ -291,14 +293,22 @@ class DiT(ModelMixin, ConfigMixin):
                 )
             all_hidden_states.append(hidden_states)
 
+            # Capture penultimate layer for physical intent extraction
+            if return_penultimate and idx == len(self.transformer_blocks) - 2:
+                penultimate_hidden = hidden_states.clone()
+
         # Output processing
         conditioning = temb
         shift, scale = self.proj_out_1(F.silu(conditioning)).chunk(2, dim=1)
         hidden_states = self.norm_out(hidden_states) * (1 + scale[:, None]) + shift[:, None]
+        result = self.proj_out_2(hidden_states)
+
         if return_all_hidden_states:
-            return self.proj_out_2(hidden_states), all_hidden_states
+            return result, all_hidden_states
+        elif return_penultimate:
+            return result, penultimate_hidden
         else:
-            return self.proj_out_2(hidden_states)
+            return result
 
 
 class SelfAttentionTransformer(ModelMixin, ConfigMixin):
