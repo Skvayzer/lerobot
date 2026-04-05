@@ -456,7 +456,7 @@ class _ACTCraftNet(nn.Module):
                 continue
             if "system0" in name or "tactile_feedback_proj" in name:
                 continue
-            if p.dim() > 1 and not isinstance(p, nn.Embedding):
+            if p.dim() > 1 and "embed" not in name:
                 nn.init.xavier_uniform_(p)
 
     def _encode_vae(self, state, action_chunk, action_is_pad):
