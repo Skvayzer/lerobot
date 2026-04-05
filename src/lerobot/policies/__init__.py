@@ -26,6 +26,7 @@ def _optional_import(module: str, attr: str) -> object | None:
 
 
 ACTConfig = _optional_import(".act.configuration_act", "ACTConfig")
+ACTCraftNetConfig = _optional_import(".act_craftnet.configuration_act_craftnet", "ACTCraftNetConfig")
 DiffusionConfig = _optional_import(".diffusion.configuration_diffusion", "DiffusionConfig")
 GrootConfig = _optional_import(".groot.configuration_groot", "GrootConfig")
 GrootCoTConfig = _optional_import(".grootCoT.configuration_groot", "GrootCoTConfig")
@@ -60,4 +61,8 @@ __all__ = [
     ]
     if globals().get(name) is not None
 ]
+
+# Ensure ACTCraftNetConfig triggers its register_subclass decorator on import
+if ACTCraftNetConfig is not None:
+    __all__.append("ACTCraftNetConfig")
 
